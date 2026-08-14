@@ -216,6 +216,20 @@ app.post('/api/dream', authMiddleware, apiLimiter, async (req, res) => {
   }
 });
 
+
+// ── Keep-alive ping (prevents Railway cold start delays) ──────────────────────
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN + '/health'
+  : null;
+
+if (SELF_URL) {
+  setInterval(async () => {
+    try {
+      await fetch(SELF_URL);
+    } catch (e) {}
+  }, 5 * 60 * 1000); // every 5 minutes
+}
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 initDB().then(() => {
