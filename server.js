@@ -75,6 +75,13 @@ const authLimiter = rateLimit({ windowMs: 15*60*1000, max: 10 });
 const apiLimiter = rateLimit({ windowMs: 60*1000, max: 30 });
 
 // ── Health ─────────────────────────────────────────────────────────────────────
+const path = require('path');
+
+// ── Admin HTML page ────────────────────────────────────────────────────────────
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'admin.html'));
+});
+
 app.get('/health', (req, res) => res.json({
   status: 'alive',
   hasKey: !!process.env.ANTHROPIC_API_KEY,
