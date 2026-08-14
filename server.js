@@ -22,6 +22,7 @@ async function initDB() {
       id SERIAL PRIMARY KEY,
       email TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
+      lang TEXT DEFAULT 'en',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS dreams (
@@ -34,6 +35,15 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS feedback (
+      id SERIAL PRIMARY KEY,
+      email TEXT,
+      text TEXT NOT NULL,
+      page TEXT,
+      stage TEXT,
+      lang TEXT DEFAULT 'en',
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
   console.log('Database ready');
@@ -135,6 +145,45 @@ app.put('/dreams/:id', authMiddleware, apiLimiter, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Failed to save dream' });
+  }
+});
+
+// ── Feedback ───────────────────────────────────────────────────────────────────
+app.post('/feedback', async (req, res) => {
+  const { text, email, page, stage } = req.body;
+  if (!text) return res.status(400).json({ error: 'Feedback text required' });
+  try {
+    await db.query(
+      'INSERT INTO feedback (email, text, page, stage) VALUES ($1, $2, $3, $4)',
+      [email || null, text, page || null, stage || null]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to save feedback' });
+  }
+});
+
+// ── Admin feedback view (password protected) ────────────────────────────────
+app.get('/admin/feedback', async (req, res) => {
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const result = await db.query('SELECT * FROM feedback ORDER BY created_at DESC LIMIT 100');
+    res.json(result.rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ── User language preference ──────────────────────────────────────────────────
+app.put('/user/lang', authMiddleware, async (req, res) => {
+  const { lang } = req.body;
+  try {
+    await db.query('UPDATE users SET lang = $1 WHERE id = $2', [lang, req.userId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed' });
   }
 });
 
