@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Mandala · Admin</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600&family=Cormorant+Garamond:ital,wght@0,400;1,400&display=swap');
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#0a0805;color:#d4b896;font-family:'Cormorant Garamond',serif;min-height:100vh;padding:40px 24px;}
+.container{max-width:800px;margin:0 auto;}
+h1{font-family:'Cinzel',serif;font-size:20px;letter-spacing:4px;color:#c9a84c;margin-bottom:4px;}
+.sub{font-size:12px;letter-spacing:2px;color:#5c3a1a;margin-bottom:32px;}
+.login{background:#13131f;border:1px solid #3d2a0f44;border-radius:2px;padding:28px;max-width:360px;}
+input{width:100%;background:#080603;border:1px solid #3d2a0f66;color:#d4b896;padding:12px 16px;font-family:'Cormorant Garamond',serif;font-size:15px;border-radius:1px;outline:none;margin-bottom:12px;}
+button{font-family:'Cinzel',serif;font-size:10px;letter-spacing:3px;padding:12px 24px;background:linear-gradient(135deg,#7a1828,#6a1020);border:1px solid #8b263555;color:#f5e8c8;border-radius:1px;cursor:pointer;width:100%;}
+button:hover{border-color:#8b2635;}
+.card{background:#13131f;border:1px solid #3d2a0f44;border-radius:2px;padding:20px;margin-bottom:12px;}
+.card-meta{font-family:'Cinzel',serif;font-size:8px;letter-spacing:2px;color:#5c3a1a;margin-bottom:8px;}
+.card-text{font-size:15px;line-height:1.7;color:#c8b090;}
+.card-email{font-size:11px;color:#8b6a3a;margin-top:8px;}
+.card-page{display:inline-block;font-family:'Cinzel',serif;font-size:8px;letter-spacing:1px;color:#c9a84c88;border:1px solid #c9a84c33;padding:2px 8px;border-radius:1px;margin-top:6px;}
+.empty{text-align:center;padding:60px;color:#3d2a0f;font-style:italic;}
+.count{font-family:'Cinzel',serif;font-size:9px;letter-spacing:3px;color:#5c3a1a;margin-bottom:20px;}
+.error{color:#8b2635;font-size:13px;margin-top:8px;font-style:italic;}
+#login-view{display:block;}
+#feedback-view{display:none;}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>MANDALA</h1>
+  <div class="sub">ADMIN · FEEDBACK</div>
+
+  <div id="login-view" class="login">
+    <div style="font-family:'Cinzel',serif;font-size:9px;letter-spacing:3px;color:#8b6a3a;margin-bottom:16px;">ENTER ADMIN KEY</div>
+    <input type="password" id="key-input" placeholder="Admin key…" onkeydown="if(event.key==='Enter')load()"/>
+    <button onclick="load()">Access Feedback</button>
+    <div class="error" id="err" style="display:none;">Invalid key</div>
+  </div>
+
+  <div id="feedback-view">
+    <div class="count" id="count"></div>
+    <div id="feed-list"></div>
+  </div>
+</div>
+
+<script>
+const BASE = window.location.origin;
+
+async function load(){
+  const key = document.getElementById('key-input').value.trim();
+  if(!key) return;
+  document.getElementById('err').style.display='none';
+  try {
+    const res = await fetch(BASE+'/admin/feedback', {
+      headers: {'x-admin-key': key}
+    });
+    if(res.status === 401){
+      document.getElementById('err').style.display='block';
+      return;
+    }
+    const data = await res.json();
+    document.getElementById('login-view').style.display='none';
+    document.getElementById('feedback-view').style.display='block';
+    document.getElementById('count').textContent = data.length + ' FEEDBACK ENTRIES';
+
+    const list = document.getElementById('feed-list');
+    if(data.length === 0){
+      list.innerHTML = '<div class="empty">No feedback yet — the vessel is empty.</div>';
+      return;
+    }
+    list.innerHTML = data.map(f => {
+      const date = new Date(f.created_at).toLocaleString();
+      return `<div class="card">
+        <div class="card-meta">${date}</div>
+        <div class="card-text">${esc(f.text)}</div>
+        ${f.email ? `<div class="card-email">From: ${esc(f.email)}</div>` : ''}
+        ${f.page ? `<span class="card-page">${esc(f.page)}${f.stage?' · '+esc(f.stage):''}</span>` : ''}
+      </div>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('err').textContent = 'Error: '+e.message;
+    document.getElementById('err').style.display='block';
+  }
+}
+
+function esc(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+</body>
+</html>
