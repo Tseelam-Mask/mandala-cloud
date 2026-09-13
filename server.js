@@ -73,6 +73,7 @@ function authMiddleware(req, res, next) {
 // ── Rate limiting ──────────────────────────────────────────────────────────────
 const authLimiter = rateLimit({ windowMs: 15*60*1000, max: 10 });
 const apiLimiter = rateLimit({ windowMs: 60*1000, max: 30 });
+const guestLimiter = rateLimit({ windowMs: 60*60*1000, max: 20, message: {error:'Guest limit reached — sign in for unlimited access'} });
 
 // ── Health ─────────────────────────────────────────────────────────────────────
 const path = require('path');
@@ -195,7 +196,17 @@ app.put('/user/lang', authMiddleware, async (req, res) => {
 });
 
 // ── Claude proxy (requires auth) ───────────────────────────────────────────────
-app.post('/api/dream', authMiddleware, apiLimiter, async (req, res) => {
+app.post('/api/dream', apiLimiter, async (req, res) => {
+  // Optional auth — guests can use basic analysis without signing in
+  const header = req.headers.authorization;
+  if (header && header.startsWith('Bearer ')) {
+    try {
+      const payload = jwt.verify(header.slice(7), JWT_SECRET);
+      req.userId = payload.userId;
+    } catch(e) {
+      return res.status(401).json({ error: 'Session expired — please log in again' });
+    }
+  }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'API key not configured' });
   try {
