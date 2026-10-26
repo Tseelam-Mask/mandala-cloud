@@ -10,7 +10,7 @@
     "express-rate-limit": "^7.1.5",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.11.3",
-    "swisseph": "^2.10.4"
+    "swisseph": "^2.10.3"
   },
   "engines": { "node": ">=18" }
 }
