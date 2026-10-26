@@ -601,6 +601,26 @@ app.get('/api/longitudinal/brief', authMiddleware, async (req, res) => {
       alchemical: r.alchemical,
     }));
 
+    // Last pattern reading — most recent session with a record
+    const prRow = await db.query(
+      `SELECT record, updated_at FROM map_reading_sessions
+       WHERE user_id=$1 AND record IS NOT NULL
+       ORDER BY updated_at DESC LIMIT 1`,
+      [req.userId]
+    );
+    let lastPatternReading = null;
+    if (prRow.rows.length) {
+      const rec = prRow.rows[0].record;
+      lastPatternReading = {
+        date: prRow.rows[0].updated_at,
+        whatWasNamed: rec.what_was_named || null,
+        dreamerInsight: rec.dreamer_insight || null,
+        openQuestions: rec.open_questions || [],
+        alchemicalStage: rec.alchemical_stage_observed || null,
+        archetypalMovement: rec.archetypal_movement || null,
+      };
+    }
+
     res.json({
       success: true,
       period: `${days} days`,
@@ -622,6 +642,7 @@ app.get('/api/longitudinal/brief', authMiddleware, async (req, res) => {
         moonSign: r.moon_sign, entries: parseInt(r.entries), symbols: parseInt(r.count)
       })),
       entryBreakdown: entryRows.rows,
+      lastPatternReading,
     });
   } catch(e) {
     console.error('Longitudinal brief error:', e);
@@ -792,6 +813,49 @@ setInterval(async () => {
 
 // ── Map Reading Sessions ───────────────────────────────────────────────────────
 
+// Index symbols_discussed from a pattern reading record into symbol_index
+// Uses a stable pseudo entry_id so re-saves don't duplicate
+async function indexPatternReadingSymbols(userId, sessionId, record, sessionCreatedAt) {
+  if (!record || !record.symbols_discussed || !record.symbols_discussed.length) return;
+  const pseudoEntryId = `pr_${sessionId}`;
+  const alchemical = record.alchemical_stage_observed || null;
+  const createdAt = sessionCreatedAt || new Date().toISOString();
+
+  // Remove old rows for this session so a re-save replaces cleanly
+  await db.query(
+    `DELETE FROM symbol_index WHERE user_id=$1 AND entry_id=$2`,
+    [userId, pseudoEntryId]
+  );
+
+  for (const sym of record.symbols_discussed) {
+    if (!sym || sym.length < 2) continue;
+    try {
+      await db.query(`
+        INSERT INTO symbol_index
+          (user_id, entry_id, entry_type, symbol, symbol_type, archetype, alchemical,
+           moon_sign, sun_sign, mercury_retro, venus_retro, lunar_phase, created_at)
+        VALUES ($1,$2,'pattern_reading',$3,'symbol',NULL,$4,
+                NULL,NULL,FALSE,FALSE,'unknown',$5)
+        ON CONFLICT (user_id, entry_id, symbol) DO UPDATE SET alchemical=EXCLUDED.alchemical
+      `, [userId, pseudoEntryId, sym.toLowerCase(), alchemical, createdAt]);
+    } catch(e) { /* skip */ }
+  }
+  // Also index key_themes as symbols with type 'theme'
+  for (const theme of (record.key_themes || [])) {
+    if (!theme || theme.length < 2) continue;
+    try {
+      await db.query(`
+        INSERT INTO symbol_index
+          (user_id, entry_id, entry_type, symbol, symbol_type, archetype, alchemical,
+           moon_sign, sun_sign, mercury_retro, venus_retro, lunar_phase, created_at)
+        VALUES ($1,$2,'pattern_reading',$3,'theme',NULL,$4,
+                NULL,NULL,FALSE,FALSE,'unknown',$5)
+        ON CONFLICT (user_id, entry_id, symbol) DO NOTHING
+      `, [userId, pseudoEntryId, theme.toLowerCase(), alchemical, createdAt]);
+    } catch(e) { /* skip */ }
+  }
+}
+
 // GET /api/map-sessions — list all sessions for user (newest first)
 app.get('/api/map-sessions', authMiddleware, async (req, res) => {
   try {
@@ -820,7 +884,14 @@ app.post('/api/map-sessions', authMiddleware, async (req, res) => {
        VALUES ($1,$2,$3,$4) RETURNING id, created_at`,
       [req.userId, title || null, JSON.stringify(conversation), record ? JSON.stringify(record) : null]
     );
-    res.json({ success: true, session: result.rows[0] });
+    const session = result.rows[0];
+    // Index symbols into longitudinal memory
+    if (record) {
+      indexPatternReadingSymbols(req.userId, session.id, record, session.created_at).catch(e =>
+        console.warn('Pattern reading symbol index failed:', e.message)
+      );
+    }
+    res.json({ success: true, session });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -833,12 +904,19 @@ app.put('/api/map-sessions/:id', authMiddleware, async (req, res) => {
     const result = await db.query(
       `UPDATE map_reading_sessions
        SET title=$1, conversation=$2, record=$3, updated_at=NOW()
-       WHERE id=$4 AND user_id=$5 RETURNING id`,
+       WHERE id=$4 AND user_id=$5 RETURNING id, created_at`,
       [title || null, JSON.stringify(conversation || []),
        record ? JSON.stringify(record) : null,
        req.params.id, req.userId]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: 'Session not found' });
+    // Re-index symbols whenever record is updated (replaces old rows for this session)
+    if (record) {
+      const sess = result.rows[0];
+      indexPatternReadingSymbols(req.userId, sess.id, record, sess.created_at).catch(e =>
+        console.warn('Pattern reading symbol index update failed:', e.message)
+      );
+    }
     res.json({ success: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
