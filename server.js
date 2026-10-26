@@ -212,6 +212,29 @@ app.put('/dreams/:id', authMiddleware, apiLimiter, async (req, res) => {
   }
 });
 
+// ── Delete dream + clean up symbol_index ──────────────────────────────────────
+app.delete('/dreams/:id', authMiddleware, apiLimiter, async (req, res) => {
+  const entryId = req.params.id;
+  try {
+    // Remove symbol memory footprint first (so longitudinal brief recomputes cleanly)
+    await db.query(
+      'DELETE FROM symbol_index WHERE entry_id=$1 AND user_id=$2',
+      [entryId, req.userId]
+    );
+    // Then delete the dream itself
+    const result = await db.query(
+      'DELETE FROM dreams WHERE id=$1 AND user_id=$2',
+      [entryId, req.userId]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Entry not found' });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to delete entry' });
+  }
+});
+
 // ── AstroRead: retroactively populate sky snapshots for all dreams ─────────────
 app.post('/api/astroread/populate', authMiddleware, async (req, res) => {
   try {
