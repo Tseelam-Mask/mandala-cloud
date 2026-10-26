@@ -24,8 +24,25 @@ async function initDB() {
       email TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       lang TEXT DEFAULT 'en',
+      birth_date TEXT,
+      birth_time TEXT,
+      birth_lat DOUBLE PRECISION,
+      birth_lon DOUBLE PRECISION,
+      birth_place TEXT,
+      natal_chart JSONB,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    -- migrate existing users table if columns missing
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='birth_date') THEN
+        ALTER TABLE users ADD COLUMN birth_date TEXT;
+        ALTER TABLE users ADD COLUMN birth_time TEXT;
+        ALTER TABLE users ADD COLUMN birth_lat DOUBLE PRECISION;
+        ALTER TABLE users ADD COLUMN birth_lon DOUBLE PRECISION;
+        ALTER TABLE users ADD COLUMN birth_place TEXT;
+        ALTER TABLE users ADD COLUMN natal_chart JSONB;
+      END IF;
+    END $$;
     CREATE TABLE IF NOT EXISTS dreams (
       id TEXT NOT NULL,
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -196,6 +213,56 @@ app.put('/user/lang', authMiddleware, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ── Birth profile ─────────────────────────────────────────────────────────────
+app.get('/api/user/profile', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT birth_date, birth_time, birth_lat, birth_lon, birth_place, natal_chart FROM users WHERE id = $1',
+      [req.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true, profile: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/user/profile', authMiddleware, async (req, res) => {
+  const { birth_date, birth_time, birth_lat, birth_lon, birth_place } = req.body;
+  if (!birth_date) return res.status(400).json({ error: 'birth_date required' });
+  try {
+    // Compute natal chart via internal ephemeris
+    const birthISO = birth_time
+      ? `${birth_date}T${birth_time}:00.000Z`
+      : `${birth_date}T12:00:00.000Z`;
+    const baseUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+      : `http://localhost:${process.env.PORT || 3000}`;
+    const natalRes = await fetch(`${baseUrl}/api/ephemeris/natal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        birthDate: birthISO,
+        birthLat: parseFloat(birth_lat) || 0,
+        birthLon: parseFloat(birth_lon) || 0,
+      })
+    });
+    const natalData = await natalRes.json();
+    const natal_chart = natalData.success ? natalData.natalChart : null;
+    await db.query(
+      `UPDATE users SET birth_date=$1, birth_time=$2, birth_lat=$3, birth_lon=$4,
+       birth_place=$5, natal_chart=$6 WHERE id=$7`,
+      [birth_date, birth_time || null, parseFloat(birth_lat) || null,
+       parseFloat(birth_lon) || null, birth_place || null,
+       natal_chart ? JSON.stringify(natal_chart) : null, req.userId]
+    );
+    res.json({ success: true, natal_chart });
+  } catch (e) {
+    console.error('Profile update error:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
