@@ -10,7 +10,13 @@
  * The swisseph package ships ephemeris data files — no external API needed.
  */
 
-const swisseph = require('swisseph');
+let swisseph;
+try {
+  swisseph = require('swisseph');
+  console.log('[ephemeris] swisseph loaded OK');
+} catch(e) {
+  console.error('[ephemeris] swisseph FAILED to load:', e.message);
+}
 const express  = require('express');
 const router   = express.Router();
 
