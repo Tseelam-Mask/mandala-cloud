@@ -93,6 +93,16 @@ async function initDB() {
       lang TEXT DEFAULT 'en',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    -- Map Reading sessions (Jung / subconscious map analytic sessions)
+    CREATE TABLE IF NOT EXISTS map_reading_sessions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT,
+      conversation JSONB NOT NULL DEFAULT '[]',
+      record JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
   console.log('Database ready');
 }
@@ -779,6 +789,90 @@ const SELF_URL = 'https://mandala-cloud-production.up.railway.app/health';
 setInterval(async () => {
   try { await fetch(SELF_URL); console.log('ping ok'); } catch (e) {}
 }, 3 * 60 * 1000); // every 3 minutes
+
+// ── Map Reading Sessions ───────────────────────────────────────────────────────
+
+// GET /api/map-sessions — list all sessions for user (newest first)
+app.get('/api/map-sessions', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, title, record, created_at, updated_at,
+              jsonb_array_length(conversation) as turn_count
+       FROM map_reading_sessions WHERE user_id=$1
+       ORDER BY updated_at DESC`,
+      [req.userId]
+    );
+    res.json({ success: true, sessions: result.rows });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/map-sessions — save current conversation as a new session
+app.post('/api/map-sessions', authMiddleware, async (req, res) => {
+  const { title, conversation, record } = req.body;
+  if (!Array.isArray(conversation) || conversation.length === 0) {
+    return res.status(400).json({ error: 'conversation required' });
+  }
+  try {
+    const result = await db.query(
+      `INSERT INTO map_reading_sessions (user_id, title, conversation, record)
+       VALUES ($1,$2,$3,$4) RETURNING id, created_at`,
+      [req.userId, title || null, JSON.stringify(conversation), record ? JSON.stringify(record) : null]
+    );
+    res.json({ success: true, session: result.rows[0] });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/map-sessions/:id — update conversation + record + title
+app.put('/api/map-sessions/:id', authMiddleware, async (req, res) => {
+  const { title, conversation, record } = req.body;
+  try {
+    const result = await db.query(
+      `UPDATE map_reading_sessions
+       SET title=$1, conversation=$2, record=$3, updated_at=NOW()
+       WHERE id=$4 AND user_id=$5 RETURNING id`,
+      [title || null, JSON.stringify(conversation || []),
+       record ? JSON.stringify(record) : null,
+       req.params.id, req.userId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Session not found' });
+    res.json({ success: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/map-sessions/:id — load full conversation for a session
+app.get('/api/map-sessions/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, title, conversation, record, created_at, updated_at
+       FROM map_reading_sessions WHERE id=$1 AND user_id=$2`,
+      [req.params.id, req.userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    res.json({ success: true, session: result.rows[0] });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/map-sessions/:id — delete a session
+app.delete('/api/map-sessions/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      `DELETE FROM map_reading_sessions WHERE id=$1 AND user_id=$2`,
+      [req.params.id, req.userId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Session not found' });
+    res.json({ success: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
