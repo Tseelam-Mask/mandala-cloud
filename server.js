@@ -230,11 +230,17 @@ app.get('/api/astroread/summary', authMiddleware, async (req, res) => {
     const mercRetro = { retro: 0, direct: 0 };
     const venusRetro = { retro: 0, direct: 0 };
     const lunarPhases = { new: 0, waxing: 0, full: 0, waning: 0 };
+    // Per-entry-type moon distributions
+    const moonByType = {}; // { dream: {Scorpio:3,...}, sign: {...}, ... }
+    const typeCounts = {};
 
     const entries = dreams.map(d => {
       const snap = d.sky_snapshot;
       if (!snap || !snap.planets) return null;
       const p = snap.planets;
+      // Infer entry type from stages JSONB
+      const st = d.stages || {};
+      const entryType = st.entryType || d.symbol?.split(':')[0] || 'dream';
       const moonSign = p.moon?.sign, sunSign = p.sun?.sign;
       if (moonSign) moonDist[moonSign] = (moonDist[moonSign]||0)+1;
       if (sunSign)  sunDist[sunSign]   = (sunDist[sunSign]||0)+1;
@@ -246,14 +252,18 @@ app.get('/api/astroread/summary', authMiddleware, async (req, res) => {
       else if (angle < 135)             lunarPhases.waxing++;
       else if (angle < 225)             lunarPhases.full++;
       else                              lunarPhases.waning++;
+      // Per-type breakdowns
+      if (!moonByType[entryType]) moonByType[entryType] = {};
+      if (moonSign) moonByType[entryType][moonSign] = (moonByType[entryType][moonSign]||0)+1;
+      typeCounts[entryType] = (typeCounts[entryType]||0)+1;
       return {
         id: d.id, title: d.title, date: d.date, created_at: d.created_at,
-        moonSign, sunSign,
+        entryType, moonSign, sunSign,
         mercury_retro: p.mercury?.retrograde, venus_retro: p.venus?.retrograde,
         saturn_sign: p.saturn?.sign, north_node_sign: p.northNode?.sign,
         sun_lon: sunLon, moon_lon: moonLon, symbol: d.symbol,
-        has_journal: !!(d.stages?.journal),
-        journal_excerpt: d.stages?.journal ? d.stages.journal.slice(0,120) : null,
+        has_journal: !!(st.journal),
+        journal_excerpt: st.journal ? st.journal.slice(0,120) : null,
       };
     }).filter(Boolean);
 
@@ -270,11 +280,19 @@ app.get('/api/astroread/summary', authMiddleware, async (req, res) => {
       };
     }
 
+    // Sort per-type moon distributions
+    const moonByTypeSorted = {};
+    for (const [type, dist] of Object.entries(moonByType)) {
+      moonByTypeSorted[type] = Object.entries(dist).sort((a,b)=>b[1]-a[1]);
+    }
+
     res.json({
       success: true,
       totalEntries: entries.length,
+      typeCounts,
       moonDistribution: Object.entries(moonDist).sort((a,b)=>b[1]-a[1]),
       sunDistribution:  Object.entries(sunDist).sort((a,b)=>b[1]-a[1]),
+      moonByType: moonByTypeSorted,
       mercuryRetrograde: mercRetro,
       venusRetrograde: venusRetro,
       lunarPhases,
