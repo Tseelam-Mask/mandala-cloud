@@ -364,4 +364,4 @@ router.post('/transits', (req, res) => {
   }
 });
 
-module.exports = { router, buildOracleAstroContext };
+module.exports = { router, buildOracleAstroContext, buildSkySnapshot };

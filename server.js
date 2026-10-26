@@ -50,10 +50,16 @@ async function initDB() {
       date TEXT,
       stages JSONB DEFAULT '{}',
       symbol TEXT,
+      sky_snapshot JSONB,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (id, user_id)
     );
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='dreams' AND column_name='sky_snapshot') THEN
+        ALTER TABLE dreams ADD COLUMN sky_snapshot JSONB;
+      END IF;
+    END $$;
     CREATE TABLE IF NOT EXISTS feedback (
       id SERIAL PRIMARY KEY,
       email TEXT,
@@ -160,20 +166,124 @@ app.get('/dreams', authMiddleware, apiLimiter, async (req, res) => {
   }
 });
 
-// ── Save dream ─────────────────────────────────────────────────────────────────
+// ── Save dream (with optional sky snapshot) ────────────────────────────────────
 app.put('/dreams/:id', authMiddleware, apiLimiter, async (req, res) => {
-  const { title, date, stages, symbol } = req.body;
+  const { title, date, stages, symbol, sky_snapshot } = req.body;
   try {
     await db.query(`
-      INSERT INTO dreams (id, user_id, title, date, stages, symbol, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      INSERT INTO dreams (id, user_id, title, date, stages, symbol, sky_snapshot, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
       ON CONFLICT (id, user_id) DO UPDATE SET
         title = EXCLUDED.title, date = EXCLUDED.date,
-        stages = EXCLUDED.stages, symbol = EXCLUDED.symbol, updated_at = NOW()
-    `, [req.params.id, req.userId, title, date, JSON.stringify(stages), symbol || null]);
+        stages = EXCLUDED.stages, symbol = EXCLUDED.symbol,
+        sky_snapshot = COALESCE(EXCLUDED.sky_snapshot, dreams.sky_snapshot),
+        updated_at = NOW()
+    `, [req.params.id, req.userId, title, date, JSON.stringify(stages),
+        symbol || null, sky_snapshot ? JSON.stringify(sky_snapshot) : null]);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Failed to save dream' });
+  }
+});
+
+// ── AstroRead: retroactively populate sky snapshots for all dreams ─────────────
+app.post('/api/astroread/populate', authMiddleware, async (req, res) => {
+  try {
+    const { buildSkySnapshot } = require('./ephemeris');
+    const rows = await db.query(
+      'SELECT id, created_at FROM dreams WHERE user_id=$1 AND sky_snapshot IS NULL',
+      [req.userId]
+    );
+    let populated = 0;
+    for (const row of rows.rows) {
+      try {
+        const snap = buildSkySnapshot(row.created_at.toISOString());
+        await db.query(
+          'UPDATE dreams SET sky_snapshot=$1 WHERE id=$2 AND user_id=$3',
+          [JSON.stringify(snap), row.id, req.userId]
+        );
+        populated++;
+      } catch(e) { /* skip individual failures */ }
+    }
+    res.json({ success: true, populated, total: rows.rows.length });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── AstroRead: longitudinal correlation summary ────────────────────────────────
+app.get('/api/astroread/summary', authMiddleware, async (req, res) => {
+  try {
+    const dreamRows = await db.query(
+      `SELECT id, title, date, stages, symbol, sky_snapshot, created_at
+       FROM dreams WHERE user_id=$1 AND sky_snapshot IS NOT NULL ORDER BY created_at ASC`,
+      [req.userId]
+    );
+    const userRow = await db.query(
+      'SELECT natal_chart FROM users WHERE id=$1', [req.userId]
+    );
+    const natalChart = userRow.rows[0]?.natal_chart || null;
+    const dreams = dreamRows.rows;
+
+    // Distributions
+    const moonDist = {}, sunDist = {};
+    const mercRetro = { retro: 0, direct: 0 };
+    const venusRetro = { retro: 0, direct: 0 };
+    const lunarPhases = { new: 0, waxing: 0, full: 0, waning: 0 };
+
+    const entries = dreams.map(d => {
+      const snap = d.sky_snapshot;
+      if (!snap || !snap.planets) return null;
+      const p = snap.planets;
+      const moonSign = p.moon?.sign, sunSign = p.sun?.sign;
+      if (moonSign) moonDist[moonSign] = (moonDist[moonSign]||0)+1;
+      if (sunSign)  sunDist[sunSign]   = (sunDist[sunSign]||0)+1;
+      if (p.mercury?.retrograde) mercRetro.retro++; else mercRetro.direct++;
+      if (p.venus?.retrograde)   venusRetro.retro++; else venusRetro.direct++;
+      const sunLon = p.sun?.longitude||0, moonLon = p.moon?.longitude||0;
+      const angle  = ((moonLon - sunLon) + 360) % 360;
+      if (angle < 45 || angle >= 315)   lunarPhases.new++;
+      else if (angle < 135)             lunarPhases.waxing++;
+      else if (angle < 225)             lunarPhases.full++;
+      else                              lunarPhases.waning++;
+      return {
+        id: d.id, title: d.title, date: d.date, created_at: d.created_at,
+        moonSign, sunSign,
+        mercury_retro: p.mercury?.retrograde, venus_retro: p.venus?.retrograde,
+        saturn_sign: p.saturn?.sign, north_node_sign: p.northNode?.sign,
+        sun_lon: sunLon, moon_lon: moonLon, symbol: d.symbol,
+        has_journal: !!(d.stages?.journal),
+        journal_excerpt: d.stages?.journal ? d.stages.journal.slice(0,120) : null,
+      };
+    }).filter(Boolean);
+
+    // Natal correlations
+    let natalCorrelations = null;
+    if (natalChart && natalChart.planets) {
+      const np = natalChart.planets;
+      const natalMoon = np.moon?.sign, natalSun = np.sun?.sign, natalAsc = natalChart.ascendantSign;
+      natalCorrelations = {
+        natalMoon, natalSun, natalAsc,
+        entriesUnderNatalMoonSign: entries.filter(e=>e.moonSign===natalMoon).length,
+        entriesUnderNatalSunSign:  entries.filter(e=>e.sunSign===natalSun).length,
+        entriesWhileMoonInAsc:     entries.filter(e=>e.moonSign===natalAsc).length,
+      };
+    }
+
+    res.json({
+      success: true,
+      totalEntries: entries.length,
+      moonDistribution: Object.entries(moonDist).sort((a,b)=>b[1]-a[1]),
+      sunDistribution:  Object.entries(sunDist).sort((a,b)=>b[1]-a[1]),
+      mercuryRetrograde: mercRetro,
+      venusRetrograde: venusRetro,
+      lunarPhases,
+      natalCorrelations,
+      entries,
+    });
+  } catch(e) {
+    console.error('AstroRead error:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
