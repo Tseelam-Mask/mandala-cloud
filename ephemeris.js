@@ -256,6 +256,7 @@ Hold this awareness silently. Let it inform the depth and direction of your ques
  * Returns: current sky positions + houses if lat/lon provided
  */
 router.get('/', (req, res) => {
+  if (!swisseph) return res.status(500).json({ ok: false, error: 'swisseph not available — check build logs' });
   try {
     const date = req.query.date ? new Date(req.query.date) : new Date();
     const lat  = req.query.lat  ? parseFloat(req.query.lat)  : null;
