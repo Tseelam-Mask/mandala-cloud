@@ -952,6 +952,175 @@ app.delete('/api/map-sessions/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// ── GET /api/clinical/brief — generate four-section clinical brief from patient's record ──
+app.get('/api/clinical/brief', authMiddleware, async (req, res) => {
+  try {
+    // 1. Pull alchemical sequence across all entries (chronological)
+    const alchRows = await db.query(
+      `SELECT id, date, title,
+              stages->'memoryRecord'->'alchemical_territory' AS alch,
+              stages->'memoryRecord'->'individuation_marker' AS individuation,
+              stages->>'entryType' AS entry_type
+       FROM dreams
+       WHERE user_id=$1
+         AND stages->'memoryRecord' IS NOT NULL
+       ORDER BY created_at ASC`,
+      [req.userId]
+    );
+
+    // 2. Pull all somatic summaries chronologically
+    const somaticRows = await db.query(
+      `SELECT date, title,
+              stages->'memoryRecord'->>'somatic_summary' AS somatic,
+              stages->>'entryType' AS entry_type
+       FROM dreams
+       WHERE user_id=$1
+         AND stages->'memoryRecord'->>'somatic_summary' IS NOT NULL
+         AND stages->'memoryRecord'->>'somatic_summary' != ''
+       ORDER BY created_at ASC`,
+      [req.userId]
+    );
+
+    // 3. Pull all figures across all entries
+    const figuresRows = await db.query(
+      `SELECT date, title, created_at,
+              stages->'memoryRecord'->'figures' AS figures
+       FROM dreams
+       WHERE user_id=$1
+         AND stages->'memoryRecord'->'figures' IS NOT NULL
+         AND jsonb_array_length(stages->'memoryRecord'->'figures') > 0
+       ORDER BY created_at ASC`,
+      [req.userId]
+    );
+
+    // 4. Pull all open questions chronologically
+    const questionsRows = await db.query(
+      `SELECT date, title,
+              stages->'memoryRecord'->>'oracle_question_left_open' AS question
+       FROM dreams
+       WHERE user_id=$1
+         AND stages->'memoryRecord'->>'oracle_question_left_open' IS NOT NULL
+         AND stages->'memoryRecord'->>'oracle_question_left_open' != ''
+       ORDER BY created_at ASC`,
+      [req.userId]
+    );
+
+    // 5. Last pattern reading record
+    const prRow = await db.query(
+      `SELECT record, updated_at FROM map_reading_sessions
+       WHERE user_id=$1 AND record IS NOT NULL
+       ORDER BY updated_at DESC LIMIT 1`,
+      [req.userId]
+    );
+
+    if (alchRows.rows.length === 0) {
+      return res.json({ success: true, brief: null, message: 'No mapped entries yet' });
+    }
+
+    // Assemble source data for the generation prompt
+    const alchemicalSequence = alchRows.rows.map(r => {
+      const alch = r.alch || {};
+      const ind = r.individuation || {};
+      return `[${r.entry_type||'dream'}] ${r.date||''} — ${alch.primary||'unmapped'}${alch.secondary?'/'+alch.secondary:''}${alch.transition?' (transition)':''}${ind.threshold_crossed?' | THRESHOLD: '+ind.threshold_description:''}`;
+    }).join('\n');
+
+    const somaticSummaries = somaticRows.rows.map(r =>
+      `${r.date||''} [${r.entry_type||'dream'}]: ${r.somatic}`
+    ).join('\n');
+
+    // Aggregate figures — track first vs last appearance per figure name
+    const figureMap = {};
+    figuresRows.rows.forEach(row => {
+      const figs = row.figures || [];
+      figs.forEach(f => {
+        if (!f.name) return;
+        if (!figureMap[f.name]) {
+          figureMap[f.name] = { first: { date: row.date, ...f }, last: { date: row.date, ...f }, count: 0 };
+        }
+        figureMap[f.name].last = { date: row.date, ...f };
+        figureMap[f.name].count++;
+      });
+    });
+    const figuresEvolution = Object.values(figureMap)
+      .sort((a, b) => b.count - a.count)
+      .map(fig => {
+        const f = fig.first;
+        const l = fig.last;
+        const changed = f.date !== l.date;
+        return `${f.name} [${f.archetypal_category||'unknown archetype'}] — first: ${f.date||'?'}, relationship: ${f.relationship_to_dreamer||'?'}` +
+          (changed ? ` → most recent: ${l.date||'?'}, relationship: ${l.relationship_to_dreamer||'?'}` : ' (single appearance)') +
+          ` (${fig.count} total)`;
+      }).join('\n');
+
+    const openQuestions = questionsRows.rows.map(r =>
+      `${r.date||''}: ${r.question}`
+    ).join('\n');
+
+    const patternReadingSection = prRow.rows.length ? (() => {
+      const rec = prRow.rows[0].record;
+      return `Most recent pattern reading (${new Date(prRow.rows[0].updated_at).toLocaleDateString()}):
+What was named: ${rec.what_was_named||'—'}
+Dreamer insight: ${rec.dreamer_insight||'—'}
+Archetypal movement: ${rec.archetypal_movement||'—'}
+Open questions: ${(rec.open_questions||[]).join('; ')||'—'}
+Alchemical stage observed: ${rec.alchemical_stage_observed||'—'}`;
+    })() : null;
+
+    const sourceData = `ALCHEMICAL SEQUENCE (${alchRows.rows.length} entries, chronological):
+${alchemicalSequence}
+
+SOMATIC THREAD (${somaticRows.rows.length} entries):
+${somaticSummaries || 'None recorded'}
+
+FIGURES EVOLUTION (${Object.keys(figureMap).length} distinct figures):
+${figuresEvolution || 'None recorded'}
+
+OPEN QUESTIONS — chronological (${questionsRows.rows.length} total):
+${openQuestions || 'None recorded'}
+${patternReadingSection ? '\nPATTERN READING CONTEXT:\n' + patternReadingSection : ''}`;
+
+    // Call Claude to render the four sections as clinical prose
+    const { Anthropic } = require('@anthropic-ai/sdk');
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const generationPrompt = `You are generating a clinical brief for a Jungian analyst.
+Your source is structured data extracted from a patient's Mandala record — a personal depth practice tool tracking dreams, visions, synchronicities, feelings, and waking journal entries through a Jungian framework.
+Your task is to render this data as readable clinical prose — four sections, maximum two pages total.
+
+You are not the Oracle. You do not interpret, probe, or hold tension. You narrate what the data shows with precision and economy. Use Jungian language naturally but without obscurity. Write as one clinician communicating to another.
+
+NEVER editorialize. NEVER diagnose. NEVER reassure. NEVER speculate beyond what the data holds. Render what is there.
+
+If a section has sparse data, say so briefly and move on. Do not pad.
+
+THE FOUR SECTIONS:
+
+**THE ARC** — Narrative of alchemical trajectory across time. Not raw stage labels — rendered as movement. How long has the material been in current territory? What flickers of transition have appeared? What does the overall direction suggest? Note any threshold crossings and what they describe.
+
+**THE BODY THREAD** — Somatic entries narrated sequentially. Where the charge lives across time, how it has moved or remained fixed. If sparse, note it.
+
+**THE FIGURES** — Each recurring figure tracked by relationship evolution: not frequency count but the delta between first and most recent appearance. How did the ego stand toward this figure initially versus most recently? Archetypal category noted.
+
+**THE OPEN QUESTIONS** — Every oracle question left open, presented chronologically. These are the points where the patient is currently suspended. Present them as the analyst's entry point map — what remains unresolved and therefore alive.
+
+SOURCE DATA:
+${sourceData}`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: generationPrompt }]
+    });
+
+    const briefText = message.content[0].text;
+    res.json({ success: true, brief: briefText, entryCount: alchRows.rows.length, generatedAt: new Date().toISOString() });
+
+  } catch(e) {
+    console.error('Clinical brief error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 initDB().then(() => {
