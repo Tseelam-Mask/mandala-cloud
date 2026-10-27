@@ -1009,8 +1009,31 @@ app.delete('/api/map-sessions/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// ── GET /api/clinical/brief — generate four-section clinical brief from patient's record ──
-app.get('/api/clinical/brief', authMiddleware, async (req, res) => {
+// ── GET /api/clinical/brief — generate four-section clinical brief ─────────────
+// Accepts: patient JWT (their own record) OR analyst JWT with ?as=<patientId>
+app.get('/api/clinical/brief', async (req, res) => {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  const raw = header.slice(7);
+  let targetUserId;
+  try {
+    const payload = jwt.verify(raw, JWT_SECRET);
+    if (payload.analystId) {
+      // Analyst access — must supply ?as=patientId and have active link
+      const patientId = parseInt(req.query.as);
+      if (!patientId) return res.status(400).json({ error: 'Analyst must supply ?as=<patientId>' });
+      const linkRow = await db.query(
+        `SELECT id FROM analyst_patient_links WHERE analyst_id=$1 AND patient_user_id=$2 AND status='active'`,
+        [payload.analystId, patientId]
+      );
+      if (!linkRow.rows.length) return res.status(403).json({ error: 'No active link with this patient' });
+      targetUserId = patientId;
+    } else {
+      targetUserId = payload.userId;
+    }
+  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+  req.userId = targetUserId;
   try {
     // 1. Pull alchemical sequence across all entries (chronological)
     const alchRows = await db.query(
