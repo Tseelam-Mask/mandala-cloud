@@ -103,6 +103,34 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    -- Analyst accounts (separate from patient users)
+    CREATE TABLE IF NOT EXISTS analyst_accounts (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      name TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    -- Analyst ↔ patient links
+    CREATE TABLE IF NOT EXISTS analyst_patient_links (
+      id SERIAL PRIMARY KEY,
+      analyst_id INTEGER REFERENCES analyst_accounts(id) ON DELETE CASCADE,
+      patient_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      invite_token TEXT UNIQUE NOT NULL,
+      status TEXT DEFAULT 'pending',  -- pending | active | revoked
+      patient_consented_at TIMESTAMPTZ,
+      analyst_note TEXT,
+      analyst_note_consumed BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(analyst_id, patient_user_id)
+    );
+    -- Patient consent flag on users table
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='analyst_consent') THEN
+        ALTER TABLE users ADD COLUMN analyst_consent BOOLEAN DEFAULT FALSE;
+      END IF;
+    END $$;
   `);
   console.log('Database ready');
 }
@@ -787,6 +815,35 @@ app.post('/api/dream', apiLimiter, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'API key not configured' });
   try {
+    // Inject analyst note into system prompt if one exists for this patient
+    let payload = req.body;
+    if (req.userId && payload.system) {
+      try {
+        const noteRow = await db.query(
+          `SELECT apl.id, apl.analyst_note, aa.name AS analyst_name
+           FROM analyst_patient_links apl
+           JOIN analyst_accounts aa ON aa.id = apl.analyst_id
+           WHERE apl.patient_user_id = $1 AND apl.status = 'active'
+             AND apl.analyst_note IS NOT NULL AND apl.analyst_note_consumed = FALSE
+           ORDER BY apl.updated_at DESC LIMIT 1`,
+          [req.userId]
+        );
+        if (noteRow.rows.length) {
+          const { id: linkId, analyst_note, analyst_name } = noteRow.rows[0];
+          const analystLayer = `\n\n[ANALYST CONTEXT — for Oracle awareness only, not to be quoted or attributed directly]\nThe patient's analyst (${analyst_name || 'their analyst'}) has left the following observation:\n"${analyst_note}"\nHold this as background clinical context. Do not reference the analyst explicitly. Let it inform your attunement to what is alive in this session.`;
+          payload = { ...payload, system: payload.system + analystLayer };
+          // Mark note consumed after it enters the session
+          await db.query(
+            `UPDATE analyst_patient_links SET analyst_note_consumed = TRUE, updated_at = NOW() WHERE id = $1`,
+            [linkId]
+          );
+        }
+      } catch(noteErr) {
+        console.error('Analyst note injection error (non-fatal):', noteErr.message);
+        // Continue without note — never block the session
+      }
+    }
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -794,7 +851,7 @@ app.post('/api/dream', apiLimiter, async (req, res) => {
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(payload),
     });
     const data = await response.json();
     if (!response.ok) return res.status(response.status).json({ error: data.error?.message || 'API error' });
@@ -1125,6 +1182,185 @@ ${sourceData}`;
     console.error('Clinical brief error:', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── Analyst auth middleware ────────────────────────────────────────────────────
+function analystAuthMiddleware(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    if (!payload.analystId) return res.status(403).json({ error: 'Not an analyst account' });
+    req.analystId = payload.analystId;
+    next();
+  } catch { res.status(401).json({ error: 'Invalid token' }); }
+}
+
+// ── POST /api/analyst/register — create analyst account ───────────────────────
+app.post('/api/analyst/register', async (req, res) => {
+  const { email, password, name } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const r = await db.query(
+      'INSERT INTO analyst_accounts (email, password_hash, name) VALUES ($1,$2,$3) RETURNING id, email, name',
+      [email.toLowerCase().trim(), hash, name || null]
+    );
+    const token = jwt.sign({ analystId: r.rows[0].id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, analyst: r.rows[0] });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Email already registered' });
+    console.error(e); res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── POST /api/analyst/login ────────────────────────────────────────────────────
+app.post('/api/analyst/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+  try {
+    const r = await db.query('SELECT * FROM analyst_accounts WHERE email=$1', [email.toLowerCase().trim()]);
+    if (!r.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, r.rows[0].password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ analystId: r.rows[0].id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, analyst: { id: r.rows[0].id, email: r.rows[0].email, name: r.rows[0].name } });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── POST /api/analyst/invite — generate invite token for a patient email ───────
+app.post('/api/analyst/invite', analystAuthMiddleware, async (req, res) => {
+  const { patient_email } = req.body;
+  if (!patient_email) return res.status(400).json({ error: 'patient_email required' });
+  try {
+    // Find patient user
+    const uRow = await db.query('SELECT id FROM users WHERE email=$1', [patient_email.toLowerCase().trim()]);
+    if (!uRow.rows.length) return res.status(404).json({ error: 'No Mandala account found for that email' });
+    const patientId = uRow.rows[0].id;
+
+    // Generate unique invite token
+    const crypto = require('crypto');
+    const token = crypto.randomBytes(24).toString('hex');
+
+    const r = await db.query(
+      `INSERT INTO analyst_patient_links (analyst_id, patient_user_id, invite_token, status)
+       VALUES ($1, $2, $3, 'pending')
+       ON CONFLICT (analyst_id, patient_user_id) DO UPDATE
+         SET invite_token = $3, status = 'pending', updated_at = NOW()
+       RETURNING id, invite_token`,
+      [req.analystId, patientId, token]
+    );
+    res.json({ invite_token: r.rows[0].invite_token, link_id: r.rows[0].id });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── POST /api/patient/consent — patient accepts analyst link via token ─────────
+app.post('/api/patient/consent', authMiddleware, async (req, res) => {
+  const { invite_token } = req.body;
+  if (!invite_token) return res.status(400).json({ error: 'invite_token required' });
+  try {
+    const r = await db.query(
+      `UPDATE analyst_patient_links
+       SET status = 'active', patient_consented_at = NOW(), updated_at = NOW()
+       WHERE invite_token = $1 AND patient_user_id = $2 AND status = 'pending'
+       RETURNING id`,
+      [invite_token, req.userId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Invalid or already used token' });
+
+    // Set consent flag on user
+    await db.query('UPDATE users SET analyst_consent = TRUE WHERE id = $1', [req.userId]);
+    res.json({ success: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── POST /api/patient/revoke — patient revokes analyst access ─────────────────
+app.post('/api/patient/revoke', authMiddleware, async (req, res) => {
+  const { link_id } = req.body;
+  if (!link_id) return res.status(400).json({ error: 'link_id required' });
+  try {
+    await db.query(
+      `UPDATE analyst_patient_links SET status = 'revoked', updated_at = NOW()
+       WHERE id = $1 AND patient_user_id = $2`,
+      [link_id, req.userId]
+    );
+    // Check if any active links remain; if not, clear consent flag
+    const active = await db.query(
+      `SELECT id FROM analyst_patient_links WHERE patient_user_id=$1 AND status='active'`,
+      [req.userId]
+    );
+    if (!active.rows.length) {
+      await db.query('UPDATE users SET analyst_consent = FALSE WHERE id = $1', [req.userId]);
+    }
+    res.json({ success: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── GET /api/patient/links — patient sees their analyst connections ────────────
+app.get('/api/patient/links', authMiddleware, async (req, res) => {
+  try {
+    const r = await db.query(
+      `SELECT apl.id, apl.status, apl.patient_consented_at, aa.name AS analyst_name, aa.email AS analyst_email
+       FROM analyst_patient_links apl
+       JOIN analyst_accounts aa ON aa.id = apl.analyst_id
+       WHERE apl.patient_user_id = $1 AND apl.status != 'revoked'
+       ORDER BY apl.created_at DESC`,
+      [req.userId]
+    );
+    res.json({ links: r.rows });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── GET /api/analyst/patients — analyst sees their linked patients ─────────────
+app.get('/api/analyst/patients', analystAuthMiddleware, async (req, res) => {
+  try {
+    const r = await db.query(
+      `SELECT apl.id AS link_id, apl.status, apl.patient_consented_at,
+              u.email AS patient_email, u.id AS patient_id
+       FROM analyst_patient_links apl
+       JOIN users u ON u.id = apl.patient_user_id
+       WHERE apl.analyst_id = $1 AND apl.status = 'active'
+       ORDER BY apl.patient_consented_at DESC`,
+      [req.analystId]
+    );
+    res.json({ patients: r.rows });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── GET /api/analyst/brief/:patientId — analyst pulls clinical brief for active patient ──
+app.get('/api/analyst/brief/:patientId', analystAuthMiddleware, async (req, res) => {
+  const patientId = parseInt(req.params.patientId);
+  try {
+    // Verify active link
+    const linkRow = await db.query(
+      `SELECT id FROM analyst_patient_links
+       WHERE analyst_id=$1 AND patient_user_id=$2 AND status='active'`,
+      [req.analystId, patientId]
+    );
+    if (!linkRow.rows.length) return res.status(403).json({ error: 'No active link with this patient' });
+
+    // Forward to the same clinical brief logic, impersonating the patient user
+    req.userId = patientId;
+    // Reuse clinical brief generation by redirecting internally
+    res.redirect(307, `/api/clinical/brief`);
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── POST /api/analyst/note — analyst leaves a note for the Oracle ──────────────
+app.post('/api/analyst/note', analystAuthMiddleware, async (req, res) => {
+  const { patient_id, note } = req.body;
+  if (!patient_id || !note) return res.status(400).json({ error: 'patient_id and note required' });
+  try {
+    const r = await db.query(
+      `UPDATE analyst_patient_links
+       SET analyst_note = $1, analyst_note_consumed = FALSE, updated_at = NOW()
+       WHERE analyst_id = $2 AND patient_user_id = $3 AND status = 'active'
+       RETURNING id`,
+      [note.trim(), req.analystId, patient_id]
+    );
+    if (!r.rows.length) return res.status(403).json({ error: 'No active link with this patient' });
+    res.json({ success: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────────
