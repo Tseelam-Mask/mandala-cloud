@@ -1079,10 +1079,6 @@ OPEN QUESTIONS — chronological (${questionsRows.rows.length} total):
 ${openQuestions || 'None recorded'}
 ${patternReadingSection ? '\nPATTERN READING CONTEXT:\n' + patternReadingSection : ''}`;
 
-    // Call Claude to render the four sections as clinical prose
-    const { Anthropic } = require('@anthropic-ai/sdk');
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
     const generationPrompt = `You are generating a clinical brief for a Jungian analyst.
 Your source is structured data extracted from a patient's Mandala record — a personal depth practice tool tracking dreams, visions, synchronicities, feelings, and waking journal entries through a Jungian framework.
 Your task is to render this data as readable clinical prose — four sections, maximum two pages total.
@@ -1106,13 +1102,23 @@ THE FOUR SECTIONS:
 SOURCE DATA:
 ${sourceData}`;
 
-    const message = await anthropic.messages.create({
-      model: 'claude-opus-4-5',
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: generationPrompt }]
+    // Use fetch (same pattern as rest of server.js — no SDK dependency)
+    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-5',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: generationPrompt }]
+      })
     });
-
-    const briefText = message.content[0].text;
+    if (!claudeRes.ok) throw new Error(`Claude API error: ${claudeRes.status}`);
+    const claudeData = await claudeRes.json();
+    const briefText = claudeData.content[0].text;
     res.json({ success: true, brief: briefText, entryCount: alchRows.rows.length, generatedAt: new Date().toISOString() });
 
   } catch(e) {
