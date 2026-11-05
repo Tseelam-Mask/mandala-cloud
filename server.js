@@ -844,12 +844,22 @@ app.post('/api/dream', apiLimiter, async (req, res) => {
       }
     }
 
+    // Convert system string → cached content block so Anthropic caches the
+    // system prompt prefix (saves 90% on input tokens for turns 2+)
+    if (payload.system && typeof payload.system === 'string') {
+      payload = {
+        ...payload,
+        system: [{ type: 'text', text: payload.system, cache_control: { type: 'ephemeral' } }]
+      };
+    }
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'prompt-caching-2024-07-31'
       },
       body: JSON.stringify(payload),
     });
