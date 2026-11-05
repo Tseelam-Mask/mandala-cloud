@@ -131,6 +131,15 @@ async function initDB() {
         ALTER TABLE users ADD COLUMN analyst_consent BOOLEAN DEFAULT FALSE;
       END IF;
     END $$;
+    -- Stored clinical briefs (archived, never regenerated unless requested)
+    CREATE TABLE IF NOT EXISTS clinical_briefs (
+      id SERIAL PRIMARY KEY,
+      patient_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      brief_text TEXT NOT NULL,
+      entry_count INTEGER,
+      generated_by TEXT DEFAULT 'patient',  -- 'patient' | 'analyst'
+      generated_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
   console.log('Database ready');
 }
@@ -1209,12 +1218,87 @@ ${sourceData}`;
     if (!claudeRes.ok) throw new Error(`Claude API error: ${claudeRes.status}`);
     const claudeData = await claudeRes.json();
     const briefText = claudeData.content[0].text;
-    res.json({ success: true, brief: briefText, entryCount: alchRows.rows.length, generatedAt: new Date().toISOString() });
+    const entryCount = alchRows.rows.length;
+
+    // Persist to archive — never overwrite, always append
+    const generatedBy = req.analystId ? 'analyst' : 'patient';
+    const saved = await db.query(
+      `INSERT INTO clinical_briefs (patient_user_id, brief_text, entry_count, generated_by)
+       VALUES ($1, $2, $3, $4) RETURNING id, generated_at`,
+      [req.userId, briefText, entryCount, generatedBy]
+    );
+
+    res.json({
+      success: true,
+      brief: briefText,
+      briefId: saved.rows[0].id,
+      entryCount,
+      generatedAt: saved.rows[0].generated_at
+    });
 
   } catch(e) {
     console.error('Clinical brief error:', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── GET /api/clinical/briefs — list archived briefs for a patient ──────────────
+// Accepts patient JWT or analyst JWT with ?as=<patientId>
+app.get('/api/clinical/briefs', async (req, res) => {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    let targetUserId;
+    if (payload.analystId) {
+      const patientId = parseInt(req.query.as);
+      if (!patientId) return res.status(400).json({ error: 'Analyst must supply ?as=<patientId>' });
+      const linkRow = await db.query(
+        `SELECT id FROM analyst_patient_links WHERE analyst_id=$1 AND patient_user_id=$2 AND status='active'`,
+        [payload.analystId, patientId]
+      );
+      if (!linkRow.rows.length) return res.status(403).json({ error: 'No active link with this patient' });
+      targetUserId = patientId;
+    } else {
+      targetUserId = payload.userId;
+    }
+    const r = await db.query(
+      `SELECT id, entry_count, generated_by, generated_at
+       FROM clinical_briefs WHERE patient_user_id=$1
+       ORDER BY generated_at DESC LIMIT 20`,
+      [targetUserId]
+    );
+    res.json({ briefs: r.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/clinical/briefs/:id — fetch one archived brief ───────────────────
+app.get('/api/clinical/briefs/:id', async (req, res) => {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    let targetUserId;
+    if (payload.analystId) {
+      const patientId = parseInt(req.query.as);
+      if (!patientId) return res.status(400).json({ error: 'Analyst must supply ?as=<patientId>' });
+      const linkRow = await db.query(
+        `SELECT id FROM analyst_patient_links WHERE analyst_id=$1 AND patient_user_id=$2 AND status='active'`,
+        [payload.analystId, patientId]
+      );
+      if (!linkRow.rows.length) return res.status(403).json({ error: 'No active link with this patient' });
+      targetUserId = patientId;
+    } else {
+      targetUserId = payload.userId;
+    }
+    const r = await db.query(
+      `SELECT id, brief_text, entry_count, generated_by, generated_at
+       FROM clinical_briefs WHERE id=$1 AND patient_user_id=$2`,
+      [req.params.id, targetUserId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Brief not found' });
+    res.json({ brief: r.rows[0].brief_text, ...r.rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Analyst auth middleware ────────────────────────────────────────────────────
