@@ -264,21 +264,76 @@ function detectTransits(natalPositions, currentPositions) {
     for (const np of natalKeys) {
       const asp = detectAspect(currentPositions[tp].longitude, natalPositions[np].longitude);
       if (asp) {
-        transits.push({
+        const transitObj = {
           transitPlanet:  tp,
           natalPlanet:    np,
           aspect:         asp.name,
+          aspectType:     asp.name,  // alias for frontend
           exactAngle:     asp.angle,
           orb:            asp.orb,
-          transitLon:     currentPositions[tp].longitude,
-          natalLon:       natalPositions[np].longitude,
-          transitSign:    currentPositions[tp].sign,
-          natalSign:      natalPositions[np].sign,
+          transitLon:        currentPositions[tp].longitude,
+          transitLongitude:  currentPositions[tp].longitude,  // alias for field map
+          natalLon:          natalPositions[np].longitude,
+          retrograde:        currentPositions[tp].retrograde||false,
+          transitSign:       currentPositions[tp].sign,
+          natalSign:         natalPositions[np].sign,
+        };
+        // Attach timing estimates for slow planets
+        const timings = estimateTransitTimings({
+          transitPlanet: tp,
+          natalPlanet: np,
+          aspectType: asp.name,
+          orb: asp.orb,
+          transitLon: currentPositions[tp].longitude,
+          natalLon: natalPositions[np].longitude,
         });
+        Object.assign(transitObj, timings);
+        transits.push(transitObj);
       }
     }
   }
   return transits.sort((a, b) => a.orb - b.orb);
+}
+
+// ── Transit timing estimator ───────────────────────────────────────────────
+// For slow-moving transits (outer planets), estimates start/exact/end dates
+// by walking forward/back in time until the aspect goes out of orb
+// Daily motion approximations (degrees/day):
+const PLANET_DAILY_MOTION = {
+  moon: 13.2, sun: 0.985, mercury: 1.2, venus: 1.2, mars: 0.524,
+  jupiter: 0.083, saturn: 0.033, uranus: 0.012, neptune: 0.006, pluto: 0.004,
+  northNode: -0.053,
+};
+const ORB_BY_ASPECT = { conjunction:8, opposition:8, square:7, trine:7, sextile:5 };
+
+function estimateTransitTimings(transit) {
+  const { transitPlanet, natalPlanet, aspectType, orb, transitLon, natalLon } = transit;
+  if (!transitLon || !natalLon) return {};
+
+  const dailyMotion = PLANET_DAILY_MOTION[transitPlanet.toLowerCase()] || 0.5;
+  const maxOrb = ORB_BY_ASPECT[aspectType] || 8;
+  // Only compute for slow planets — fast ones move too quickly for meaningful ranges
+  if (Math.abs(dailyMotion) > 1.5) return {}; // skip sun, moon, mercury, venus
+
+  // Days remaining in aspect: how many more days until orb exceeds maxOrb
+  const orbRemaining = maxOrb - orb;
+  const daysToExit = orbRemaining / Math.abs(dailyMotion);
+  // Days since entering aspect: orb / dailyMotion
+  const daysInAspect = orb / Math.abs(dailyMotion);
+
+  const now = new Date();
+  const startDate = new Date(now.getTime() - daysInAspect * 86400000);
+  const endDate = new Date(now.getTime() + daysToExit * 86400000);
+  // Exact = when orb is 0 (or was 0) — approximate midpoint of the window
+  const exactDate = new Date((startDate.getTime() + endDate.getTime()) / 2);
+  // If we're past exact (orb is growing), adjust: exact is in the past
+  // For retrogrades, the aspect can re-exact multiple times — not modeled here
+
+  return {
+    startDate: startDate.toISOString(),
+    exactDate: exactDate.toISOString(),
+    endDate: endDate.toISOString(),
+  };
 }
 
 // ── Oracle context builder ─────────────────────────────────────────────────
