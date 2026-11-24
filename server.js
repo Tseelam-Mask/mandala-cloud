@@ -154,6 +154,12 @@ async function initDB() {
         ALTER TABLE clinical_briefs ADD COLUMN analysis_json JSONB;
       END IF;
     END $$;
+    -- Add from_date column to clinical_briefs (date range filter used when generating)
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='clinical_briefs' AND column_name='from_date') THEN
+        ALTER TABLE clinical_briefs ADD COLUMN from_date DATE;
+      END IF;
+    END $$;
   `);
   console.log('Database ready');
 }
@@ -1048,7 +1054,11 @@ app.delete('/api/map-sessions/:id', authMiddleware, async (req, res) => {
  * Gather all patient data needed for clinical analysis.
  * Returns { alchRows, somaticRows, figuresRows, questionsRows, symbolRows, entryCount }
  */
-async function gatherPatientClinicalData(userId) {
+async function gatherPatientClinicalData(userId, fromDate = null) {
+  const params = [userId];
+  const dateClause = fromDate ? `AND created_at >= $2::date` : '';
+  if (fromDate) params.push(fromDate);
+
   const alchRows = await db.query(
     `SELECT id, date, title,
             stages->'memoryRecord' AS memory_record,
@@ -1063,8 +1073,9 @@ async function gatherPatientClinicalData(userId) {
      FROM dreams
      WHERE user_id=$1
        AND stages->'memoryRecord' IS NOT NULL
+       ${dateClause}
      ORDER BY created_at ASC`,
-    [userId]
+    params
   );
 
   const symbolRows = await db.query(
@@ -1269,9 +1280,10 @@ app.post('/api/clinical/analyze', async (req, res) => {
   } catch { return res.status(401).json({ error: 'Invalid token' }); }
 
   try {
-    const { alchRows } = await gatherPatientClinicalData(targetUserId);
+    const fromDate = req.query.from || null;
+    const { alchRows } = await gatherPatientClinicalData(targetUserId, fromDate);
     if (!alchRows.rows.length) {
-      return res.json({ success: true, analysis: null, message: 'No mapped entries yet' });
+      return res.json({ success: true, analysis: null, message: fromDate ? `No mapped entries since ${fromDate}` : 'No mapped entries yet' });
     }
 
     const src = buildClinicalSourceData(alchRows);
@@ -1440,10 +1452,11 @@ app.get('/api/clinical/brief', async (req, res) => {
 
   req.userId = targetUserId;
   try {
-    const { alchRows } = await gatherPatientClinicalData(req.userId);
+    const fromDate = req.query.from || null; // optional YYYY-MM-DD
+    const { alchRows } = await gatherPatientClinicalData(req.userId, fromDate);
 
     if (alchRows.rows.length === 0) {
-      return res.json({ success: true, brief: null, message: 'No mapped entries yet' });
+      return res.json({ success: true, brief: null, message: fromDate ? `No mapped entries since ${fromDate}` : 'No mapped entries yet' });
     }
 
     const src = buildClinicalSourceData(alchRows);
@@ -1601,9 +1614,9 @@ ${JSON.stringify(analysisJson, null, 2)}`;
     // Persist to archive
     const generatedBy = 'analyst';
     const saved = await db.query(
-      `INSERT INTO clinical_briefs (patient_user_id, brief_text, entry_count, generated_by, analysis_json)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, generated_at`,
-      [req.userId, briefText, entryCount, generatedBy, JSON.stringify(analysisJson)]
+      `INSERT INTO clinical_briefs (patient_user_id, brief_text, entry_count, generated_by, analysis_json, from_date)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, generated_at`,
+      [req.userId, briefText, entryCount, generatedBy, JSON.stringify(analysisJson), fromDate || null]
     );
 
     res.json({
@@ -1612,6 +1625,7 @@ ${JSON.stringify(analysisJson, null, 2)}`;
       analysis: analysisJson,
       briefId: saved.rows[0].id,
       entryCount,
+      fromDate: fromDate || null,
       generatedAt: saved.rows[0].generated_at
     });
 
@@ -1642,7 +1656,7 @@ app.get('/api/clinical/briefs', async (req, res) => {
       targetUserId = payload.userId;
     }
     const r = await db.query(
-      `SELECT id, entry_count, generated_by, generated_at
+      `SELECT id, entry_count, generated_by, generated_at, from_date
        FROM clinical_briefs WHERE patient_user_id=$1
        ORDER BY generated_at DESC LIMIT 20`,
       [targetUserId]
@@ -1671,7 +1685,7 @@ app.get('/api/clinical/briefs/:id', async (req, res) => {
       targetUserId = payload.userId;
     }
     const r = await db.query(
-      `SELECT id, brief_text, entry_count, generated_by, generated_at, analysis_json
+      `SELECT id, brief_text, entry_count, generated_by, generated_at, analysis_json, from_date
        FROM clinical_briefs WHERE id=$1 AND patient_user_id=$2`,
       [req.params.id, targetUserId]
     );
