@@ -1321,6 +1321,8 @@ Extract and return exactly:
    - immediate_threshold: one sentence naming the specific next movement the individuation process is requiring
    - entry_points: array of 2-3 high-pressure symbols or figures the analyst might use as entry points
 
+Keep all string values compact — evidence fields: ≤15 words; appearance context fields: ≤10 words; ego_stance: ≤8 words. Arrays capped at 5 items max. This keeps output within token limits.
+
 Return clean JSON only. No prose. No markdown. Use this exact structure:
 {
   "primary_blockage_type": "",
@@ -1394,7 +1396,7 @@ ${src.openQuestions}`;
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5',
-        max_tokens: 4096,
+        max_tokens: 8096,
         messages: [{ role: 'user', content: promptOne }]
       })
     });
@@ -1494,6 +1496,8 @@ Extract and return exactly:
    - immediate_threshold: one sentence naming the specific next movement the individuation process is requiring
    - entry_points: array of 2-3 high-pressure symbols or figures the analyst might use as entry points
 
+Keep all string values compact — evidence fields: ≤15 words; appearance context fields: ≤10 words; ego_stance: ≤8 words. Arrays capped at 5 items max. This keeps output within token limits.
+
 Return clean JSON only. No prose. No markdown fences. Use this exact structure:
 {
   "primary_blockage_type": "",
@@ -1547,7 +1551,7 @@ ${src.openQuestions}`;
     const p1Res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 4096, messages: [{ role: 'user', content: promptOne }] })
+      body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 8096, messages: [{ role: 'user', content: promptOne }] })
     });
     if (!p1Res.ok) throw new Error(`Pattern extraction API error: ${p1Res.status}`);
     const p1Data = await p1Res.json();
