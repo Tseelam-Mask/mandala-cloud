@@ -1464,6 +1464,25 @@ app.get('/api/clinical/brief', async (req, res) => {
     const src = buildClinicalSourceData(alchRows);
     const entryCount = src.entryCount;
 
+    // Fetch most recent panoramic reading epigraph from map_reading_sessions
+    let panoramicEpigraph = null;
+    try {
+      const prRow = await db.query(
+        `SELECT record, updated_at FROM map_reading_sessions
+         WHERE user_id=$1 AND record IS NOT NULL
+         ORDER BY updated_at DESC LIMIT 1`,
+        [req.userId]
+      );
+      if (prRow.rows.length) {
+        const rec = prRow.rows[0].record;
+        const readingDate = new Date(prRow.rows[0].updated_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+        const epigraphText = rec.archetypal_movement || rec.what_was_named || null;
+        if (epigraphText) {
+          panoramicEpigraph = { text: epigraphText, date: readingDate };
+        }
+      }
+    } catch(e) { /* non-fatal — brief proceeds without epigraph */ }
+
     // Step 1 — Run Prompt One (pattern extraction) to get clinical analysis JSON
     const promptOne = `You are the analytical intelligence layer of Mandala — a Jungian depth psychology tool. Your task is not to converse or interpret. Your task is to extract precise clinical patterns from structured patient data and render them as JSON.
 
@@ -1588,7 +1607,19 @@ Two — the analyst is the clinician. You are the pattern reader. Point to what 
 
 STRUCTURE: Two pages total. The first page does all the clinical work.
 
-PAGE ONE — THE WORKING BRIEF
+${panoramicEpigraph ? `Before PAGE ONE, render this section:
+
+**PANORAMIC READING**
+Render exactly this line, verbatim, as a blockquote:
+> *"${panoramicEpigraph.text}"*
+
+Then on the next line, render: *Pattern reading — ${panoramicEpigraph.date}*
+
+Nothing else in this section. No commentary, no framing. The sentence speaks for itself.
+
+---
+
+` : ''}PAGE ONE — THE WORKING BRIEF
 
 Render these sections in exact order. Use bold markdown headers exactly as written.
 
