@@ -140,6 +140,20 @@ async function initDB() {
       generated_by TEXT DEFAULT 'patient',  -- 'patient' | 'analyst'
       generated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    -- Clinical analysis JSON (Prompt One output — pattern extraction)
+    CREATE TABLE IF NOT EXISTS clinical_analysis (
+      id SERIAL PRIMARY KEY,
+      patient_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      analysis_json JSONB NOT NULL,
+      entry_count INTEGER,
+      generated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    -- Add analysis_json column to clinical_briefs if not present
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='clinical_briefs' AND column_name='analysis_json') THEN
+        ALTER TABLE clinical_briefs ADD COLUMN analysis_json JSONB;
+      END IF;
+    END $$;
   `);
   console.log('Database ready');
 }
@@ -1028,6 +1042,363 @@ app.delete('/api/map-sessions/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// ── Clinical Intelligence Layer helpers ───────────────────────────────────────
+
+/**
+ * Gather all patient data needed for clinical analysis.
+ * Returns { alchRows, somaticRows, figuresRows, questionsRows, symbolRows, entryCount }
+ */
+async function gatherPatientClinicalData(userId) {
+  const alchRows = await db.query(
+    `SELECT id, date, title,
+            stages->'memoryRecord' AS memory_record,
+            stages->'memoryRecord'->'alchemical_territory' AS alch,
+            stages->'memoryRecord'->'individuation_marker' AS individuation,
+            stages->'memoryRecord'->'images' AS images,
+            stages->'memoryRecord'->'figures' AS figures,
+            stages->'memoryRecord'->>'somatic_summary' AS somatic_summary,
+            stages->'memoryRecord'->>'oracle_question_left_open' AS open_question,
+            stages->>'entryType' AS entry_type,
+            created_at
+     FROM dreams
+     WHERE user_id=$1
+       AND stages->'memoryRecord' IS NOT NULL
+     ORDER BY created_at ASC`,
+    [userId]
+  );
+
+  const symbolRows = await db.query(
+    `SELECT symbol, symbol_type, COUNT(*) as freq,
+            MIN(created_at) as first_seen,
+            MAX(created_at) as last_seen
+     FROM symbol_index
+     WHERE user_id=$1
+     GROUP BY symbol, symbol_type
+     ORDER BY freq DESC
+     LIMIT 30`,
+    [userId]
+  );
+
+  return { alchRows, symbolRows };
+}
+
+/**
+ * Deterministic pressure score for a symbol based on memoryRecord data.
+ * pressure_score = (frequency*15) + (emotional_intensity*25) + (somatic_charge_present*20)
+ *                + (engagement_level_inverse*25) + (recency_weight*15)
+ */
+function calcPressureScore(symbol, allEntries, totalDays) {
+  const appearances = [];
+  allEntries.forEach(row => {
+    const images = row.images || [];
+    images.forEach(img => {
+      if (!img || !img.symbol) return;
+      if (img.symbol.toLowerCase() === symbol.toLowerCase()) {
+        appearances.push(img);
+      }
+    });
+  });
+  if (appearances.length === 0) return 0;
+
+  const frequency = Math.min(appearances.length, 10);
+
+  const avgIntensity = appearances.reduce((sum, img) => {
+    const v = typeof img.emotional_intensity === 'number' ? img.emotional_intensity : 0;
+    return sum + v;
+  }, 0) / appearances.length;
+  // Normalize 0-4 scale to 0-100 for weighting
+  const emotional_intensity = avgIntensity; // 0-4
+
+  const somatic_charge_present = appearances.some(img => img.somatic_charge === true) ? 1 : 0;
+
+  const engagementMap = {
+    active_relationship: 0,
+    partially_metabolized: 1,
+    observed_not_engaged: 2,
+    avoided: 3,
+    never_addressed: 4
+  };
+  const lastEngagement = appearances[appearances.length - 1].engagement_level || 'observed_not_engaged';
+  const engagement_level_inverse = engagementMap[lastEngagement] ?? 2;
+
+  // Recency weight: days since last appearance inverted
+  const lastEntry = allEntries[allEntries.length - 1];
+  const firstEntry = allEntries[0];
+  const totalRecordDays = totalDays || 1;
+  // Find most recent appearance date
+  const lastAppDate = new Date(allEntries.filter(row => {
+    const images = row.images || [];
+    return images.some(img => img && img.symbol && img.symbol.toLowerCase() === symbol.toLowerCase());
+  }).pop()?.created_at || Date.now());
+  const daysSinceLast = Math.max(0, (Date.now() - lastAppDate.getTime()) / (1000 * 60 * 60 * 24));
+  const recency_weight = Math.max(0, 1 - (daysSinceLast / totalRecordDays));
+
+  const score = (
+    (frequency * 15) +
+    (emotional_intensity * 25) +
+    (somatic_charge_present * 20) +
+    (engagement_level_inverse * 25) +
+    (recency_weight * 15)
+  );
+
+  return Math.round(Math.min(score, 100));
+}
+
+/**
+ * Build the source data block passed to Prompt One.
+ */
+function buildClinicalSourceData(alchRows) {
+  const entries = alchRows.rows;
+  if (!entries.length) return null;
+
+  const firstDate = new Date(entries[0].created_at);
+  const lastDate = new Date(entries[entries.length - 1].created_at);
+  const totalDays = Math.max(1, (lastDate - firstDate) / (1000 * 60 * 60 * 24));
+
+  // Alchemical sequence
+  const alchemicalSequence = entries.map(r => {
+    const alch = r.alch || {};
+    const ind = r.individuation || {};
+    return `[${r.entry_type||'dream'}] ${r.date||''} — ${alch.primary||'unmapped'}${alch.secondary?'/'+alch.secondary:''}${alch.transition?' (transition)':''}${ind.threshold_crossed?' | THRESHOLD: '+ind.threshold_description:''}`;
+  }).join('\n');
+
+  // All memoryRecords as JSON (compact)
+  const memoryRecords = entries.map(r => {
+    const mr = r.memory_record || {};
+    return {
+      entry_id: r.id,
+      date: r.date || r.created_at,
+      entry_type: r.entry_type,
+      alchemical_territory: r.alch,
+      individuation_marker: r.individuation,
+      images: r.images,
+      figures: r.figures,
+      somatic_summary: r.somatic_summary,
+      oracle_question_left_open: r.open_question
+    };
+  });
+
+  // Symbol pressure index (deterministic pre-score)
+  const symbolSet = new Set();
+  entries.forEach(row => {
+    (row.images || []).forEach(img => { if (img && img.symbol) symbolSet.add(img.symbol); });
+  });
+  const symbolPressures = Array.from(symbolSet).map(sym => ({
+    symbol: sym,
+    pressure_score: calcPressureScore(sym, entries, totalDays),
+    frequency: entries.filter(r => (r.images||[]).some(img => img && img.symbol && img.symbol.toLowerCase() === sym.toLowerCase())).length
+  })).sort((a, b) => b.pressure_score - a.pressure_score).slice(0, 10);
+
+  // Figure appearances
+  const figureMap = {};
+  entries.forEach(row => {
+    (row.figures || []).forEach(f => {
+      if (!f || !f.name) return;
+      if (!figureMap[f.name]) {
+        figureMap[f.name] = { first: { date: row.date || row.created_at, ...f }, last: { date: row.date || row.created_at, ...f }, count: 0 };
+      }
+      figureMap[f.name].last = { date: row.date || row.created_at, ...f };
+      figureMap[f.name].count++;
+    });
+  });
+
+  // Open questions
+  const openQuestions = entries
+    .filter(r => r.open_question && r.open_question.trim())
+    .map(r => ({ date: r.date || r.created_at, question: r.open_question }));
+
+  // Integration gap indicator
+  // Conceptual articulation: proxy = individuation markers with threshold descriptions and open question richness
+  const thresholdCount = entries.filter(r => r.individuation && r.individuation.threshold_crossed).length;
+  const questionRichness = openQuestions.length;
+  const conceptualScore = Math.min(100, (thresholdCount * 15) + (questionRichness * 5) + (entries.length * 2));
+  // Somatic metabolization: proxy = how often somatic locations shift vs repeat
+  const somaticEntries = entries.filter(r => r.somatic_summary && r.somatic_summary.trim());
+  const somaticShift = somaticEntries.length > 1 ? Math.min(100, somaticEntries.length * 10) : 0;
+  const integrationGap = Math.max(0, conceptualScore - somaticShift);
+
+  return {
+    entryCount: entries.length,
+    totalDays: Math.round(totalDays),
+    alchemicalSequence,
+    memoryRecords: JSON.stringify(memoryRecords, null, 2),
+    symbolPressures: JSON.stringify(symbolPressures, null, 2),
+    figureMap: JSON.stringify(Object.values(figureMap).sort((a, b) => b.count - a.count), null, 2),
+    openQuestions: JSON.stringify(openQuestions, null, 2),
+    integrationGap,
+    conceptualScore,
+    somaticMetabolizationScore: somaticShift
+  };
+}
+
+// ── POST /api/clinical/analyze — Prompt One: pattern extraction → clinical_analysis JSON ──
+// Accepts analyst JWT with ?as=<patientId>
+app.post('/api/clinical/analyze', async (req, res) => {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  let targetUserId;
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    if (payload.analystId) {
+      const patientId = parseInt(req.query.as);
+      if (!patientId) return res.status(400).json({ error: 'Analyst must supply ?as=<patientId>' });
+      const linkRow = await db.query(
+        `SELECT id FROM analyst_patient_links WHERE analyst_id=$1 AND patient_user_id=$2 AND status='active'`,
+        [payload.analystId, patientId]
+      );
+      if (!linkRow.rows.length) return res.status(403).json({ error: 'No active link with this patient' });
+      targetUserId = patientId;
+    } else {
+      targetUserId = payload.userId;
+    }
+  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+  try {
+    const { alchRows } = await gatherPatientClinicalData(targetUserId);
+    if (!alchRows.rows.length) {
+      return res.json({ success: true, analysis: null, message: 'No mapped entries yet' });
+    }
+
+    const src = buildClinicalSourceData(alchRows);
+
+    const promptOne = `You are the analytical intelligence layer of Mandala — a Jungian depth psychology tool. Your task is not to converse or interpret. Your task is to extract precise clinical patterns from structured patient data and render them as JSON.
+
+Analyze the following memoryRecords, symbol pressure index, figure appearances, individuation markers, and oracle questions left open.
+
+Extract and return exactly:
+
+1. Primary and secondary blockage type — choose from: repression, inflation, projection, dissociation.
+   Evidence each with specific entry references (dates/entry types).
+
+2. Individuation stage and completion status — choose from: persona_dissolution, shadow_encounter, anima_animus_integration, self_emergence.
+   Name what specifically remains incomplete.
+
+3. Next threshold — one precise sentence naming what the individuation process is currently requiring.
+
+4. Symbol pressure index — top five symbols ranked by pressure. For each: first appearance context, most recent appearance context, delta between them, engagement_level, pressure_score.
+
+5. Figure relationship matrix — every recurring figure mapped as: avoided, projected, or active_relationship.
+   Movement across entries: static, developing, or regressing. Ego stance in one phrase.
+
+6. Somatic thread — historical charge locations, current primary location.
+   Integration gap: low (<15), medium (15-30), or high (>30).
+   Conceptual articulation score: ${src.conceptualScore}
+   Somatic metabolization score: ${src.somaticMetabolizationScore}
+   Integration gap value: ${src.integrationGap}
+
+7. Transcendent function status — tension_held, tension_collapsed, or tension_overwhelmed.
+   Name specifically which questions are being genuinely carried and which have been prematurely resolved.
+
+8. Analyst focus directive — three elements:
+   - primary_blockage: one sentence naming the most significant place where psychic energy is currently dammed
+   - immediate_threshold: one sentence naming the specific next movement the individuation process is requiring
+   - entry_points: array of 2-3 high-pressure symbols or figures the analyst might use as entry points
+
+Return clean JSON only. No prose. No markdown. Use this exact structure:
+{
+  "primary_blockage_type": "",
+  "secondary_blockage_type": "",
+  "primary_blockage_evidence": "",
+  "secondary_blockage_evidence": "",
+  "individuation_stage": "",
+  "individuation_incomplete_because": "",
+  "next_threshold": "",
+  "symbol_pressure_index": [
+    {
+      "symbol": "",
+      "pressure_score": 0,
+      "first_appearance": "",
+      "most_recent_appearance": "",
+      "delta": "",
+      "engagement_level": ""
+    }
+  ],
+  "figure_relationship_matrix": [
+    {
+      "figure": "",
+      "relationship_state": "",
+      "movement": "",
+      "ego_stance": "",
+      "first_appearance_date": "",
+      "most_recent_date": ""
+    }
+  ],
+  "somatic_thread": {
+    "historical_charge_locations": [],
+    "current_primary_location": "",
+    "integration_gap": "",
+    "integration_gap_value": ${src.integrationGap},
+    "conceptual_articulation_score": ${src.conceptualScore},
+    "somatic_metabolization_score": ${src.somaticMetabolizationScore}
+  },
+  "transcendent_function_status": "",
+  "questions_genuinely_carried": [],
+  "questions_prematurely_resolved": [],
+  "analyst_focus_directive": {
+    "primary_blockage": "",
+    "immediate_threshold": "",
+    "entry_points": []
+  }
+}
+
+SOURCE DATA (${src.entryCount} entries over ${src.totalDays} days):
+
+ALCHEMICAL SEQUENCE:
+${src.alchemicalSequence}
+
+MEMORY RECORDS (all entries):
+${src.memoryRecords}
+
+SYMBOL PRESSURE INDEX (pre-calculated):
+${src.symbolPressures}
+
+FIGURE APPEARANCES:
+${src.figureMap}
+
+OPEN QUESTIONS:
+${src.openQuestions}`;
+
+    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 3000,
+        messages: [{ role: 'user', content: promptOne }]
+      })
+    });
+    if (!claudeRes.ok) throw new Error(`Claude API error: ${claudeRes.status}`);
+    const claudeData = await claudeRes.json();
+    const rawText = claudeData.content[0].text;
+    const match = rawText.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('Pattern extraction returned no JSON');
+    const analysisJson = JSON.parse(match[0]);
+
+    // Store in clinical_analysis table
+    const saved = await db.query(
+      `INSERT INTO clinical_analysis (patient_user_id, analysis_json, entry_count)
+       VALUES ($1, $2, $3) RETURNING id, generated_at`,
+      [targetUserId, JSON.stringify(analysisJson), src.entryCount]
+    );
+
+    res.json({
+      success: true,
+      analysisId: saved.rows[0].id,
+      analysis: analysisJson,
+      entryCount: src.entryCount,
+      generatedAt: saved.rows[0].generated_at
+    });
+
+  } catch(e) {
+    console.error('Clinical analyze error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── GET /api/clinical/brief — generate four-section clinical brief ─────────────
 // Accepts: patient JWT (their own record) OR analyst JWT with ?as=<patientId>
 app.get('/api/clinical/brief', async (req, res) => {
@@ -1054,183 +1425,172 @@ app.get('/api/clinical/brief', async (req, res) => {
 
   req.userId = targetUserId;
   try {
-    // 1. Pull alchemical sequence across all entries (chronological)
-    const alchRows = await db.query(
-      `SELECT id, date, title,
-              stages->'memoryRecord'->'alchemical_territory' AS alch,
-              stages->'memoryRecord'->'individuation_marker' AS individuation,
-              stages->>'entryType' AS entry_type
-       FROM dreams
-       WHERE user_id=$1
-         AND stages->'memoryRecord' IS NOT NULL
-       ORDER BY created_at ASC`,
-      [req.userId]
-    );
-
-    // 2. Pull all somatic summaries chronologically
-    const somaticRows = await db.query(
-      `SELECT date, title,
-              stages->'memoryRecord'->>'somatic_summary' AS somatic,
-              stages->>'entryType' AS entry_type
-       FROM dreams
-       WHERE user_id=$1
-         AND stages->'memoryRecord'->>'somatic_summary' IS NOT NULL
-         AND stages->'memoryRecord'->>'somatic_summary' != ''
-       ORDER BY created_at ASC`,
-      [req.userId]
-    );
-
-    // 3. Pull all figures across all entries
-    const figuresRows = await db.query(
-      `SELECT date, title, created_at,
-              stages->'memoryRecord'->'figures' AS figures
-       FROM dreams
-       WHERE user_id=$1
-         AND stages->'memoryRecord'->'figures' IS NOT NULL
-         AND jsonb_array_length(stages->'memoryRecord'->'figures') > 0
-       ORDER BY created_at ASC`,
-      [req.userId]
-    );
-
-    // 4. Pull all open questions chronologically
-    const questionsRows = await db.query(
-      `SELECT date, title,
-              stages->'memoryRecord'->>'oracle_question_left_open' AS question
-       FROM dreams
-       WHERE user_id=$1
-         AND stages->'memoryRecord'->>'oracle_question_left_open' IS NOT NULL
-         AND stages->'memoryRecord'->>'oracle_question_left_open' != ''
-       ORDER BY created_at ASC`,
-      [req.userId]
-    );
-
-    // 5. Last pattern reading record
-    const prRow = await db.query(
-      `SELECT record, updated_at FROM map_reading_sessions
-       WHERE user_id=$1 AND record IS NOT NULL
-       ORDER BY updated_at DESC LIMIT 1`,
-      [req.userId]
-    );
+    const { alchRows } = await gatherPatientClinicalData(req.userId);
 
     if (alchRows.rows.length === 0) {
       return res.json({ success: true, brief: null, message: 'No mapped entries yet' });
     }
 
-    // Assemble source data for the generation prompt
-    const alchemicalSequence = alchRows.rows.map(r => {
-      const alch = r.alch || {};
-      const ind = r.individuation || {};
-      return `[${r.entry_type||'dream'}] ${r.date||''} — ${alch.primary||'unmapped'}${alch.secondary?'/'+alch.secondary:''}${alch.transition?' (transition)':''}${ind.threshold_crossed?' | THRESHOLD: '+ind.threshold_description:''}`;
-    }).join('\n');
+    const src = buildClinicalSourceData(alchRows);
+    const entryCount = src.entryCount;
 
-    const somaticSummaries = somaticRows.rows.map(r =>
-      `${r.date||''} [${r.entry_type||'dream'}]: ${r.somatic}`
-    ).join('\n');
+    // Step 1 — Run Prompt One (pattern extraction) to get clinical analysis JSON
+    const promptOne = `You are the analytical intelligence layer of Mandala — a Jungian depth psychology tool. Your task is not to converse or interpret. Your task is to extract precise clinical patterns from structured patient data and render them as JSON.
 
-    // Aggregate figures — track first vs last appearance per figure name
-    const figureMap = {};
-    figuresRows.rows.forEach(row => {
-      const figs = row.figures || [];
-      figs.forEach(f => {
-        if (!f.name) return;
-        if (!figureMap[f.name]) {
-          figureMap[f.name] = { first: { date: row.date, ...f }, last: { date: row.date, ...f }, count: 0 };
-        }
-        figureMap[f.name].last = { date: row.date, ...f };
-        figureMap[f.name].count++;
-      });
-    });
-    const figuresEvolution = Object.values(figureMap)
-      .sort((a, b) => b.count - a.count)
-      .map(fig => {
-        const f = fig.first;
-        const l = fig.last;
-        const changed = f.date !== l.date;
-        return `${f.name} [${f.archetypal_category||'unknown archetype'}] — first: ${f.date||'?'}, relationship: ${f.relationship_to_dreamer||'?'}` +
-          (changed ? ` → most recent: ${l.date||'?'}, relationship: ${l.relationship_to_dreamer||'?'}` : ' (single appearance)') +
-          ` (${fig.count} total)`;
-      }).join('\n');
+Analyze the following memoryRecords, symbol pressure index, figure appearances, individuation markers, and oracle questions left open.
 
-    const openQuestions = questionsRows.rows.map(r =>
-      `${r.date||''}: ${r.question}`
-    ).join('\n');
+Extract and return exactly:
 
-    const patternReadingSection = prRow.rows.length ? (() => {
-      const rec = prRow.rows[0].record;
-      return `Most recent pattern reading (${new Date(prRow.rows[0].updated_at).toLocaleDateString()}):
-What was named: ${rec.what_was_named||'—'}
-Dreamer insight: ${rec.dreamer_insight||'—'}
-Archetypal movement: ${rec.archetypal_movement||'—'}
-Open questions: ${(rec.open_questions||[]).join('; ')||'—'}
-Alchemical stage observed: ${rec.alchemical_stage_observed||'—'}`;
-    })() : null;
+1. Primary and secondary blockage type — choose from: repression, inflation, projection, dissociation.
+   Evidence each with specific entry references (dates/entry types).
 
-    const sourceData = `ALCHEMICAL SEQUENCE (${alchRows.rows.length} entries, chronological):
-${alchemicalSequence}
+2. Individuation stage and completion status — choose from: persona_dissolution, shadow_encounter, anima_animus_integration, self_emergence.
+   Name what specifically remains incomplete.
 
-SOMATIC THREAD (${somaticRows.rows.length} entries):
-${somaticSummaries || 'None recorded'}
+3. Next threshold — one precise sentence naming what the individuation process is currently requiring.
 
-FIGURES EVOLUTION (${Object.keys(figureMap).length} distinct figures):
-${figuresEvolution || 'None recorded'}
+4. Symbol pressure index — top five symbols ranked by pressure. For each: first appearance context, most recent appearance context, delta between them, engagement_level, pressure_score.
 
-OPEN QUESTIONS — chronological (${questionsRows.rows.length} total):
-${openQuestions || 'None recorded'}
-${patternReadingSection ? '\nPATTERN READING CONTEXT:\n' + patternReadingSection : ''}`;
+5. Figure relationship matrix — every recurring figure mapped as: avoided, projected, or active_relationship.
+   Movement across entries: static, developing, or regressing. Ego stance in one phrase.
 
-    const generationPrompt = `You are generating a clinical brief for a Jungian analyst.
-Your source is structured data extracted from a patient's Mandala record — a personal depth practice tool tracking dreams, visions, synchronicities, feelings, and waking journal entries through a Jungian framework.
-Your task is to render this data as readable clinical prose — four sections, maximum two pages total.
+6. Somatic thread — historical charge locations, current primary location.
+   Integration gap assessment — low (<15), medium (15-30), or high (>30).
+   Pre-calculated values: conceptual_articulation_score=${src.conceptualScore}, somatic_metabolization_score=${src.somaticMetabolizationScore}, gap=${src.integrationGap}.
 
-You are not the Oracle. You do not interpret, probe, or hold tension. You narrate what the data shows with precision and economy. Use Jungian language naturally but without obscurity. Write as one clinician communicating to another.
+7. Transcendent function status — tension_held, tension_collapsed, or tension_overwhelmed.
+   Name specifically which questions are being genuinely carried and which have been prematurely resolved.
 
-NEVER editorialize. NEVER diagnose. NEVER reassure. NEVER speculate beyond what the data holds. Render what is there.
+8. Analyst focus directive — three elements:
+   - primary_blockage: one sentence naming the most significant place where psychic energy is currently dammed
+   - immediate_threshold: one sentence naming the specific next movement the individuation process is requiring
+   - entry_points: array of 2-3 high-pressure symbols or figures the analyst might use as entry points
 
-If a section has sparse data, say so briefly and move on. Do not pad.
+Return clean JSON only. No prose. No markdown fences. Use this exact structure:
+{
+  "primary_blockage_type": "",
+  "secondary_blockage_type": "",
+  "primary_blockage_evidence": "",
+  "secondary_blockage_evidence": "",
+  "individuation_stage": "",
+  "individuation_incomplete_because": "",
+  "next_threshold": "",
+  "symbol_pressure_index": [
+    { "symbol": "", "pressure_score": 0, "first_appearance": "", "most_recent_appearance": "", "delta": "", "engagement_level": "" }
+  ],
+  "figure_relationship_matrix": [
+    { "figure": "", "relationship_state": "", "movement": "", "ego_stance": "", "first_appearance_date": "", "most_recent_date": "" }
+  ],
+  "somatic_thread": {
+    "historical_charge_locations": [],
+    "current_primary_location": "",
+    "integration_gap": "",
+    "integration_gap_value": ${src.integrationGap},
+    "conceptual_articulation_score": ${src.conceptualScore},
+    "somatic_metabolization_score": ${src.somaticMetabolizationScore}
+  },
+  "transcendent_function_status": "",
+  "questions_genuinely_carried": [],
+  "questions_prematurely_resolved": [],
+  "analyst_focus_directive": {
+    "primary_blockage": "",
+    "immediate_threshold": "",
+    "entry_points": []
+  }
+}
 
-THE FOUR SECTIONS:
+SOURCE DATA (${src.entryCount} entries over ${src.totalDays} days):
 
-**THE ARC** — Narrative of alchemical trajectory across time. Not raw stage labels — rendered as movement. How long has the material been in current territory? What flickers of transition have appeared? What does the overall direction suggest? Note any threshold crossings and what they describe.
+ALCHEMICAL SEQUENCE:
+${src.alchemicalSequence}
 
-**THE BODY THREAD** — Somatic entries narrated sequentially. Where the charge lives across time, how it has moved or remained fixed. If sparse, note it.
+MEMORY RECORDS:
+${src.memoryRecords}
 
-**THE FIGURES** — Each recurring figure tracked by relationship evolution: not frequency count but the delta between first and most recent appearance. How did the ego stand toward this figure initially versus most recently? Archetypal category noted.
+SYMBOL PRESSURE INDEX (pre-calculated):
+${src.symbolPressures}
 
-**THE OPEN QUESTIONS** — Every oracle question left open, presented chronologically. These are the points where the patient is currently suspended. Present them as the analyst's entry point map — what remains unresolved and therefore alive.
+FIGURE APPEARANCES:
+${src.figureMap}
 
-SOURCE DATA:
-${sourceData}`;
+OPEN QUESTIONS:
+${src.openQuestions}`;
 
-    // Use fetch (same pattern as rest of server.js — no SDK dependency)
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    const p1Res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 2000,
-        messages: [{ role: 'user', content: generationPrompt }]
-      })
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 3000, messages: [{ role: 'user', content: promptOne }] })
     });
-    if (!claudeRes.ok) throw new Error(`Claude API error: ${claudeRes.status}`);
-    const claudeData = await claudeRes.json();
-    const briefText = claudeData.content[0].text;
-    const entryCount = alchRows.rows.length;
+    if (!p1Res.ok) throw new Error(`Pattern extraction API error: ${p1Res.status}`);
+    const p1Data = await p1Res.json();
+    const p1Raw = p1Data.content[0].text;
+    const p1Match = p1Raw.match(/\{[\s\S]*\}/);
+    if (!p1Match) throw new Error('Pattern extraction returned no JSON');
+    const analysisJson = JSON.parse(p1Match[0]);
 
-    // Persist to archive — never overwrite, always append
-    const generatedBy = req.analystId ? 'analyst' : 'patient';
+    // Store clinical analysis
+    await db.query(
+      `INSERT INTO clinical_analysis (patient_user_id, analysis_json, entry_count) VALUES ($1, $2, $3)`,
+      [req.userId, JSON.stringify(analysisJson), entryCount]
+    );
+
+    // Step 2 — Run Prompt Two (prose rendering from JSON) → 8-section brief
+    const promptTwo = `You are generating a clinical brief for a Jungian analyst. You have received structured pattern data extracted from a patient's Mandala record. Your task is to render this data as precise clinical prose — eight sections, maximum three pages.
+
+You are not the Oracle. You do not interpret beyond what the data holds. You do not converse. You do not reassure. You write as one clinician communicating to another — with economy, precision, and genuine respect for the symbolic language.
+
+Three principles govern every sentence:
+One — name what is actually there, not what might be there. If the data is ambiguous, say so.
+Two — the analyst is the clinician. You are the pattern reader. Never tell the analyst what to do — point to what the data shows and trust their clinical judgment with what comes next.
+Three — Jung's framework is the lens, not the conclusion. The brief surfaces patterns. The analyst makes meaning with the patient in the room.
+
+Render the following sections in this exact order. Use bold markdown headers exactly as written:
+
+**ANALYST FOCUS DIRECTIVE** — half page maximum. Draw directly from analyst_focus_directive in the JSON. This is what the analyst reads in the first sixty seconds. No warmup. No context-setting. Primary blockage, immediate threshold, entry points. That is all.
+
+**THE ARC** — prose narrative of alchemical trajectory. Draw from alchemical_sequence and individuation data. Name direction, duration, what is moving, what is stalled. One paragraph.
+
+**THE BLOCKAGE MAP** — name primary and secondary blockage types. Evidence each with specific entry references from the data. Name what the blockage is protecting against. Two paragraphs maximum.
+
+**THE INDIVIDUATION STAGE** — locate precisely within the four stages. Name what remains incomplete and what the specific next threshold requires. Two paragraphs maximum.
+
+**THE SYMBOL PRESSURE INDEX** — render top three to five symbols in descending pressure order. For each: one paragraph covering first appearance, most recent appearance, what has changed or conspicuously has not changed, current engagement level. Do not editorialize. Let the delta speak.
+
+**THE FIGURE RELATIONSHIP MATRIX** — render each recurring figure in one paragraph. Name relationship state, movement across entries, ego stance. The delta between first and most recent appearance is the clinical signal — name it explicitly.
+
+**THE BODY THREAD** — render somatic timeline as clinical narrative. Where charge has lived historically, where it lives now, the integration gap named precisely. If the gap between conceptual sophistication and body metabolization is high — say so directly. This is not a judgment. It is the most important clinical signal in the record.
+
+**THE TRANSCENDENT FUNCTION STATUS** — name current status precisely. Which questions are being genuinely carried. Which have been prematurely resolved and what they were carrying before collapse occurred. What the analyst needs to protect or slow. One paragraph.
+
+**THE OPEN QUESTIONS** — render chronologically. No editorializing. These are the points where the patient is suspended. Present them as the analyst's entry point map.
+
+SOURCE JSON:
+${JSON.stringify(analysisJson, null, 2)}
+
+OPEN QUESTIONS (chronological):
+${src.openQuestions}`;
+
+    const p2Res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 3500, messages: [{ role: 'user', content: promptTwo }] })
+    });
+    if (!p2Res.ok) throw new Error(`Brief generation API error: ${p2Res.status}`);
+    const p2Data = await p2Res.json();
+    const briefText = p2Data.content[0].text;
+
+    // Persist to archive
+    const generatedBy = 'analyst';
     const saved = await db.query(
-      `INSERT INTO clinical_briefs (patient_user_id, brief_text, entry_count, generated_by)
-       VALUES ($1, $2, $3, $4) RETURNING id, generated_at`,
-      [req.userId, briefText, entryCount, generatedBy]
+      `INSERT INTO clinical_briefs (patient_user_id, brief_text, entry_count, generated_by, analysis_json)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id, generated_at`,
+      [req.userId, briefText, entryCount, generatedBy, JSON.stringify(analysisJson)]
     );
 
     res.json({
       success: true,
       brief: briefText,
+      analysis: analysisJson,
       briefId: saved.rows[0].id,
       entryCount,
       generatedAt: saved.rows[0].generated_at
@@ -1292,12 +1652,12 @@ app.get('/api/clinical/briefs/:id', async (req, res) => {
       targetUserId = payload.userId;
     }
     const r = await db.query(
-      `SELECT id, brief_text, entry_count, generated_by, generated_at
+      `SELECT id, brief_text, entry_count, generated_by, generated_at, analysis_json
        FROM clinical_briefs WHERE id=$1 AND patient_user_id=$2`,
       [req.params.id, targetUserId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Brief not found' });
-    res.json({ brief: r.rows[0].brief_text, ...r.rows[0] });
+    res.json({ brief: r.rows[0].brief_text, analysis: r.rows[0].analysis_json, ...r.rows[0] });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
