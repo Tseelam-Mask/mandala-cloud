@@ -1573,35 +1573,68 @@ ${src.openQuestions}`;
       [req.userId, JSON.stringify(analysisJson), entryCount]
     );
 
-    // Step 2 — Run Prompt Two (prose rendering from JSON) → 8-section brief
-    const promptTwo = `You are generating a clinical brief for a Jungian analyst. You have received structured pattern data extracted from a patient's Mandala record. Your task is to render this data as precise clinical prose — eight sections, maximum three pages.
+    // Step 2 — Run Prompt Two (prose rendering from JSON) → working brief + appendix
+    const promptTwo = `You are generating a clinical brief for a Jungian analyst preparing for a fifty-minute session.
 
-You are not the Oracle. You do not interpret beyond what the data holds. You do not converse. You do not reassure. You write as one clinician communicating to another — with economy, precision, and genuine respect for the symbolic language.
+You are not the Oracle. You do not interpret beyond what the data holds. You write as one clinician communicating to another — with economy, precision, and genuine respect for the symbolic language.
 
-Three principles govern every sentence:
-One — name what is actually there, not what might be there. If the data is ambiguous, say so.
-Two — the analyst is the clinician. You are the pattern reader. Never tell the analyst what to do — point to what the data shows and trust their clinical judgment with what comes next.
-Three — Jung's framework is the lens, not the conclusion. The brief surfaces patterns. The analyst makes meaning with the patient in the room.
+The goal is not completeness. The goal is orientation. The brief should create a specific quality of attention in the analyst before they enter the room.
 
-Render the following sections in this exact order. Use bold markdown headers exactly as written:
+Two governing principles:
+One — name what is actually there. If the data is ambiguous, say so.
+Two — the analyst is the clinician. You are the pattern reader. Point to what the data shows. Trust their judgment with what comes next.
 
-**ANALYST FOCUS DIRECTIVE** — half page maximum. Draw directly from analyst_focus_directive in the JSON. This is what the analyst reads in the first sixty seconds. No warmup. No context-setting. Primary blockage, immediate threshold, entry points. That is all.
+---
 
-**THE ARC** — prose narrative of alchemical trajectory. Draw from alchemical_sequence and individuation data. Name direction, duration, what is moving, what is stalled. One paragraph.
+STRUCTURE: Two pages total. The first page does all the clinical work.
 
-**THE BLOCKAGE MAP** — name primary and secondary blockage types. Evidence each with specific entry references from the data. Name what the blockage is protecting against. Two paragraphs maximum.
+PAGE ONE — THE WORKING BRIEF
 
-**THE INDIVIDUATION STAGE** — locate precisely within the four stages. Name what remains incomplete and what the specific next threshold requires. Two paragraphs maximum.
+Render these sections in exact order. Use bold markdown headers exactly as written.
 
-**THE SYMBOL PRESSURE INDEX** — render top three to five symbols in descending pressure order. For each: one paragraph covering first appearance, most recent appearance, what has changed or conspicuously has not changed, current engagement level. Do not editorialize. Let the delta speak.
+**ANALYST FOCUS DIRECTIVE**
+Draw from analyst_focus_directive in the JSON.
+Format: three sentences total — one for primary blockage, one for immediate threshold, one to introduce the entry points. Then the entry points as a simple bullet list (2–3 items, each named in 4–6 words). Nothing else. No warmup. No context. This is what the analyst reads in sixty seconds.
 
-**THE FIGURE RELATIONSHIP MATRIX** — render each recurring figure in one paragraph. Name relationship state, movement across entries, ego stance. The delta between first and most recent appearance is the clinical signal — name it explicitly.
+**THE ARC**
+Three sentences only. Direction of movement, duration, where movement has currently stalled. The analyst does not need the full alchemical narrative — they need to know where the patient is now and which way they are facing.
 
-**THE BODY THREAD** — render somatic timeline as clinical narrative. Where charge has lived historically, where it lives now, the integration gap named precisely. If the gap between conceptual sophistication and body metabolization is high — say so directly. This is not a judgment. It is the most important clinical signal in the record.
+**THE BLOCKAGE MAP**
+One paragraph only. Name the primary blockage and evidence it with one specific entry reference. Name the secondary blockage in one sentence. Name what each protects against in one sentence. Done.
 
-**THE TRANSCENDENT FUNCTION STATUS** — name current status precisely. Which questions are being genuinely carried. Which have been prematurely resolved and what they were carrying before collapse occurred. What the analyst needs to protect or slow. One paragraph.
+**INTEGRATION GAP**
+One paragraph only. Draw from somatic_thread in the JSON. State the integration gap value and what it means clinically — body ahead of language, or language ahead of body. If gap > 30, state this is the most clinically significant finding in the record and name the specific inversion. This section is the single most actionable finding in the brief.
 
-**THE OPEN QUESTIONS** — render chronologically. No editorializing. These are the points where the patient is suspended. Present them as the analyst's entry point map.
+**TOP THREE SYMBOLS UNDER PRESSURE**
+Render only the top three symbols from symbol_pressure_index by pressure_score. For each symbol: exactly four sentences — first appearance context, most recent appearance context, what has changed or conspicuously has not changed between them, current engagement level. Do not editorialize. Let the delta speak.
+
+**THE OPEN QUESTIONS**
+List questions_genuinely_carried from the JSON chronologically. No commentary, no framing sentence, no editorializing. Number them. They speak for themselves.
+
+---
+
+PAGE TWO — APPENDIX (for deeper reference if needed)
+
+Render these sections with the header **APPENDIX** followed by each sub-section.
+
+**APPENDIX**
+
+**INDIVIDUATION STAGE**
+Two sentences — where precisely within the stage, what remains incomplete. One sentence — the next threshold. Everything else the analyst will find themselves.
+
+**FIGURE RELATIONSHIP MATRIX**
+Render only figures with active clinical relevance — those whose relationship_state is active_relationship, projected, or avoided with movement not static. For each: one sentence naming the figure, their state, and the ego stance. For figures with static movement and no current clinical charge, omit entirely.
+
+**BODY THREAD — FULL HISTORY**
+Somatic charge locations in full, one sentence per location noting when it was active.
+
+**TRANSCENDENT FUNCTION**
+State the transcendent_function_status. List questions_genuinely_carried (already in Page One — do not repeat). List questions_prematurely_resolved: for each, one sentence naming what it was carrying before collapse.
+
+**FULL OPEN QUESTIONS ARCHIVE**
+All open questions from the full record. Chronological, unadorned.
+
+---
 
 SOURCE JSON:
 ${JSON.stringify(analysisJson, null, 2)}`;
