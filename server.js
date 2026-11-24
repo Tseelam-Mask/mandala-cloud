@@ -1519,14 +1519,21 @@ ${src.openQuestions}`;
     const p1Res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 3000, messages: [{ role: 'user', content: promptOne }] })
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 4096, messages: [{ role: 'user', content: promptOne }] })
     });
     if (!p1Res.ok) throw new Error(`Pattern extraction API error: ${p1Res.status}`);
     const p1Data = await p1Res.json();
     const p1Raw = p1Data.content[0].text;
-    const p1Match = p1Raw.match(/\{[\s\S]*\}/);
-    if (!p1Match) throw new Error('Pattern extraction returned no JSON');
-    const analysisJson = JSON.parse(p1Match[0]);
+    // Strip markdown fences if present, then extract JSON object
+    const p1Cleaned = p1Raw.trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```\s*$/,'').trim();
+    const p1Match = p1Cleaned.match(/\{[\s\S]*\}/);
+    if (!p1Match) throw new Error('Pattern extraction returned no JSON — raw: ' + p1Raw.slice(0, 200));
+    let analysisJson;
+    try {
+      analysisJson = JSON.parse(p1Match[0]);
+    } catch(parseErr) {
+      throw new Error('Pattern extraction JSON parse failed: ' + parseErr.message + ' — raw (truncated): ' + p1Match[0].slice(0, 300));
+    }
 
     // Store clinical analysis
     await db.query(
@@ -1573,7 +1580,7 @@ ${src.openQuestions}`;
     const p2Res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 3500, messages: [{ role: 'user', content: promptTwo }] })
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 4096, messages: [{ role: 'user', content: promptTwo }] })
     });
     if (!p2Res.ok) throw new Error(`Brief generation API error: ${p2Res.status}`);
     const p2Data = await p2Res.json();
