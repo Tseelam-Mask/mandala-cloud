@@ -1075,7 +1075,7 @@ async function gatherPatientClinicalData(userId) {
      WHERE user_id=$1
      GROUP BY symbol, symbol_type
      ORDER BY freq DESC
-     LIMIT 30`,
+     LIMIT 15`,
     [userId]
   );
 
@@ -1162,19 +1162,34 @@ function buildClinicalSourceData(alchRows) {
     return `[${r.entry_type||'dream'}] ${r.date||''} — ${alch.primary||'unmapped'}${alch.secondary?'/'+alch.secondary:''}${alch.transition?' (transition)':''}${ind.threshold_crossed?' | THRESHOLD: '+ind.threshold_description:''}`;
   }).join('\n');
 
-  // All memoryRecords as JSON (compact)
+  // All memoryRecords — trimmed to fields Prompt One actually uses
   const memoryRecords = entries.map(r => {
-    const mr = r.memory_record || {};
+    // Strip images to only the fields needed for pressure scoring + engagement
+    const images = (r.images || []).map(img => img ? {
+      symbol: img.symbol,
+      intensity: img.intensity,
+      emotional_intensity: img.emotional_intensity,
+      somatic_charge: img.somatic_charge,
+      engagement_level: img.engagement_level,
+      body_location: img.body_location
+    } : null).filter(Boolean);
+    // Strip figures to name + archetypal_category + relationship_state
+    const figures = (r.figures || []).map(f => f ? {
+      name: f.name,
+      archetypal_category: f.archetypal_category,
+      relationship_state: f.relationship_state || f.relationship_to_dreamer
+    } : null).filter(Boolean);
     return {
-      entry_id: r.id,
-      date: r.date || r.created_at,
+      date: r.date || (r.created_at ? new Date(r.created_at).toISOString().slice(0,10) : ''),
       entry_type: r.entry_type,
-      alchemical_territory: r.alch,
-      individuation_marker: r.individuation,
-      images: r.images,
-      figures: r.figures,
-      somatic_summary: r.somatic_summary,
-      oracle_question_left_open: r.open_question
+      alch_primary: r.alch ? r.alch.primary : null,
+      alch_transition: r.alch ? r.alch.transition : false,
+      threshold_crossed: r.individuation ? r.individuation.threshold_crossed : false,
+      threshold_description: r.individuation ? r.individuation.threshold_description : null,
+      images,
+      figures,
+      somatic_summary: r.somatic_summary || null,
+      open_question: r.open_question || null
     };
   });
 
@@ -1366,8 +1381,8 @@ ${src.openQuestions}`;
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 3000,
+        model: 'claude-haiku-4-5',
+        max_tokens: 4096,
         messages: [{ role: 'user', content: promptOne }]
       })
     });
@@ -1519,7 +1534,7 @@ ${src.openQuestions}`;
     const p1Res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 4096, messages: [{ role: 'user', content: promptOne }] })
+      body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 4096, messages: [{ role: 'user', content: promptOne }] })
     });
     if (!p1Res.ok) throw new Error(`Pattern extraction API error: ${p1Res.status}`);
     const p1Data = await p1Res.json();
@@ -1572,10 +1587,7 @@ Render the following sections in this exact order. Use bold markdown headers exa
 **THE OPEN QUESTIONS** — render chronologically. No editorializing. These are the points where the patient is suspended. Present them as the analyst's entry point map.
 
 SOURCE JSON:
-${JSON.stringify(analysisJson, null, 2)}
-
-OPEN QUESTIONS (chronological):
-${src.openQuestions}`;
+${JSON.stringify(analysisJson, null, 2)}`;
 
     const p2Res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
